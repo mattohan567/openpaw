@@ -10,7 +10,7 @@
 
 import { CronJob } from "cron";
 import { isMarketHours, type OpenPawConfig } from "./config.js";
-import { runAgentTurn } from "./agent.js";
+import { runAgentTurn, loadHeartbeatPrompt } from "./agent.js";
 import type { Agent } from "@mariozechner/pi-agent-core";
 import type { SessionStore } from "./session.js";
 import type { Tool } from "./tools/types.js";
@@ -37,7 +37,7 @@ export function startHeartbeat(ctx: HeartbeatContext): CronJob {
       const result = await runAgentTurn(
         ctx.agent,
         ctx.session,
-        buildHeartbeatPrompt(),
+        loadHeartbeatPrompt(),
         ctx.config,
       );
 
@@ -116,15 +116,3 @@ export function startMarketCloseJob(ctx: HeartbeatContext): CronJob | null {
   return job;
 }
 
-function buildHeartbeatPrompt(): string {
-  return [
-    "Heartbeat check. Review the following and only message me if something is notable or needs attention:",
-    "- Check portfolio positions and unrealized P&L",
-    "- Check for any filled or partially filled orders",
-    "- Scan watchlist for significant price moves (>2% intraday)",
-    "- Check for breaking news on our holdings",
-    "",
-    "If everything looks normal and stable, respond with an empty message. Only alert me if there's something I should know about.",
-    "If you do find something notable, save it to today's daily log.",
-  ].join("\n");
-}

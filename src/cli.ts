@@ -2,7 +2,10 @@ import { Command } from "commander";
 import { startGateway } from "./gateway.js";
 import { installDaemon, uninstallDaemon, daemonStatus } from "./daemon.js";
 import { loadConfig, saveConfig, CONFIG_PATH, STATE_DIR } from "./config.js";
+import { DEFAULT_SOUL, DEFAULT_HEARTBEAT } from "./agent.js";
 import { createInterface } from "node:readline";
+import { existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { WebSocket } from "ws";
 
 export function buildProgram(): Command {
@@ -131,10 +134,25 @@ export function buildProgram(): Command {
 
       saveConfig(config);
       console.log(`\nConfig saved to ${CONFIG_PATH}`);
+
+      // Create SOUL.md and HEARTBEAT.md if they don't exist
+      const soulPath = join(STATE_DIR, "SOUL.md");
+      if (!existsSync(soulPath)) {
+        writeFileSync(soulPath, DEFAULT_SOUL);
+        console.log(`Created ${soulPath} (edit to customize agent personality)`);
+      }
+
+      const heartbeatPath = join(STATE_DIR, "HEARTBEAT.md");
+      if (!existsSync(heartbeatPath)) {
+        writeFileSync(heartbeatPath, DEFAULT_HEARTBEAT);
+        console.log(`Created ${heartbeatPath} (edit to customize heartbeat checks)`);
+      }
+
       console.log("\nNext steps:");
       console.log("  1. Start: openpaw gateway run");
       console.log("  2. Scan the WhatsApp QR code when prompted");
       console.log("  3. Install daemon: openpaw daemon install");
+      console.log(`\nCustomize your agent: edit ${soulPath}`);
 
       rl.close();
     });

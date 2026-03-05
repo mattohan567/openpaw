@@ -4,32 +4,42 @@
  * Like OpenClaw, every agent turn is appended to a JSONL file.
  * Append-only means at most one line is lost on crash.
  * On startup, the session is restored from the transcript.
+ *
+ * Stores Pi SDK AgentMessage objects directly so they can be
+ * replayed back into the Agent on restart.
  */
 
 import { appendFileSync, readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { STATE_DIR } from "./config.js";
-import type Anthropic from "@anthropic-ai/sdk";
+import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { Message } from "@mariozechner/pi-ai";
 
 const SESSIONS_DIR = join(STATE_DIR, "sessions");
 
 export interface TranscriptEntry {
   id: string;
   timestamp: string;
-  role: "user" | "assistant";
-  content: unknown; // string or ContentBlock[] or ToolResultBlockParam[]
-  toolsUsed?: string[];
+  message: AgentMessage; // Full Pi SDK message (user, assistant, or toolResult)
   turnIndex: number;
+  meta?: {
+    toolsUsed?: string[];
+    tokenEstimate?: number;
+  };
 }
 
 export interface SessionStore {
   sessionId: string;
   filePath: string;
   turnCount: number;
-  append: (entry: Omit<TranscriptEntry, "id" | "timestamp" | "turnIndex">) => void;
-  loadMessages: () => Anthropic.MessageParam[];
+  /** Append a Pi SDK message to the transcript. */
+  append: (message: AgentMessage, meta?: TranscriptEntry["meta"]) => void;
+  /** Load all messages from transcript for replaying into Agent. */
+  loadMessages: () => AgentMessage[];
+  /** Rough token estimate of the transcript. */
   getTokenEstimate: () => number;
-  compact: (summary: string) => void;
+  /** Replace transcript with a compaction summary. */
+  compact: (summaryMessages: AgentMessage[]) => void;
 }
 
 let idCounter = 0;
@@ -57,92 +67,56 @@ export function openSession(sessionId: string): SessionStore {
     filePath,
     get turnCount() { return turnCount; },
 
-    append(entry) {
-      const full: TranscriptEntry = {
+    append(message: AgentMessage, meta?: TranscriptEntry["meta"]) {
+      const entry: TranscriptEntry = {
         id: generateId(),
         timestamp: new Date().toISOString(),
         turnIndex: turnCount++,
-        ...entry,
+        message,
+        meta,
       };
-      appendFileSync(filePath, JSON.stringify(full) + "\n");
+      appendFileSync(filePath, JSON.stringify(entry) + "\n");
     },
 
-    loadMessages(): Anthropic.MessageParam[] {
+    loadMessages(): AgentMessage[] {
       if (!existsSync(filePath)) return [];
 
       const lines = readFileSync(filePath, "utf-8").split("\n").filter(Boolean);
-      const messages: Anthropic.MessageParam[] = [];
+      const messages: AgentMessage[] = [];
 
       for (const line of lines) {
         try {
           const entry: TranscriptEntry = JSON.parse(line);
-          messages.push({
-            role: entry.role,
-            content: entry.content as Anthropic.MessageParam["content"],
-          });
+          if (entry.message) {
+            messages.push(entry.message);
+          }
         } catch {
           // Skip corrupted lines
         }
       }
 
-      // Ensure messages alternate correctly (Claude API requirement)
-      return normalizeMessageOrder(messages);
+      return messages;
     },
 
     getTokenEstimate(): number {
-      // Rough estimate: ~4 chars per token
       if (!existsSync(filePath)) return 0;
       const size = readFileSync(filePath, "utf-8").length;
       return Math.ceil(size / 4);
     },
 
-    compact(summary: string) {
-      // Replace entire transcript with a summary message
-      // This is like OpenClaw's compaction - save context before it overflows
-      const compactedEntry: TranscriptEntry = {
-        id: generateId(),
-        timestamp: new Date().toISOString(),
-        role: "user",
-        content: `[Session compacted. Previous context summary]\n\n${summary}`,
-        turnIndex: 0,
-      };
-      writeFileSync(filePath, JSON.stringify(compactedEntry) + "\n");
-      turnCount = 1;
+    compact(summaryMessages: AgentMessage[]) {
+      const lines = summaryMessages.map((message, i) => {
+        const entry: TranscriptEntry = {
+          id: generateId(),
+          timestamp: new Date().toISOString(),
+          turnIndex: i,
+          message,
+          meta: { tokenEstimate: 0 },
+        };
+        return JSON.stringify(entry);
+      });
+      writeFileSync(filePath, lines.join("\n") + "\n");
+      turnCount = summaryMessages.length;
     },
   };
-}
-
-/**
- * Ensure messages alternate user/assistant as Claude API requires.
- * Merge consecutive same-role messages.
- */
-function normalizeMessageOrder(messages: Anthropic.MessageParam[]): Anthropic.MessageParam[] {
-  if (messages.length === 0) return [];
-
-  const normalized: Anthropic.MessageParam[] = [];
-
-  for (const msg of messages) {
-    const last = normalized[normalized.length - 1];
-
-    if (last && last.role === msg.role) {
-      // Merge consecutive same-role messages
-      if (typeof last.content === "string" && typeof msg.content === "string") {
-        last.content = last.content + "\n" + msg.content;
-      } else {
-        // Convert to array form and concat
-        const lastArr = Array.isArray(last.content) ? last.content : [{ type: "text" as const, text: last.content as string }];
-        const msgArr = Array.isArray(msg.content) ? msg.content : [{ type: "text" as const, text: msg.content as string }];
-        last.content = [...lastArr, ...msgArr] as Anthropic.ContentBlockParam[];
-      }
-    } else {
-      normalized.push({ ...msg });
-    }
-  }
-
-  // Must start with user message
-  if (normalized.length > 0 && normalized[0].role !== "user") {
-    normalized.unshift({ role: "user", content: "[session resumed]" });
-  }
-
-  return normalized;
 }

@@ -15,7 +15,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { loadConfig, type OpenPawConfig } from "./config.js";
 import { connectWhatsApp, type WhatsAppClient } from "./whatsapp.js";
 import { createOpenPawTools } from "./tools/index.js";
-import { createAgent, runAgentTurn, DEFAULT_SOUL } from "./agent.js";
+import { createAgent, restoreSession, runAgentTurn } from "./agent.js";
 import type { Agent } from "@mariozechner/pi-agent-core";
 import { openSession } from "./session.js";
 import { startHeartbeat, startMarketOpenJob, startMarketCloseJob } from "./cron.js";
@@ -37,29 +37,21 @@ export async function startGateway(): Promise<GatewayServer> {
   console.log(`[Gateway] Port: ${config.gateway.port}`);
   console.log(`[Gateway] Paper trading: ${config.trading.paperTrading}`);
 
-  // Load system prompt
-  const systemPrompt = existsSync(config.agent.systemPromptFile)
-    ? readFileSync(config.agent.systemPromptFile, "utf-8")
-    : DEFAULT_SOUL;
-
   // Create tools
   const tools = createOpenPawTools(config);
   console.log(`[Gateway] ${tools.length} tools registered.`);
 
   // Create Pi SDK agent (same engine as OpenClaw)
-  const agent = createAgent(tools, config, systemPrompt);
+  const agent = createAgent(tools, config);
 
   // Open persistent session (JSONL transcript)
   const session = openSession("main");
-  console.log(`[Gateway] Session restored (${session.turnCount} turns from transcript).`);
+  console.log(`[Gateway] Session opened (${session.turnCount} entries in transcript).`);
 
-  // Restore agent messages from transcript
-  const savedMessages = session.loadMessages();
-  if (savedMessages.length > 0) {
-    // The Agent class expects AgentMessage format, but our saved messages
-    // are in Anthropic format. For now, we start fresh but keep the transcript
-    // for context. In future, we'd convert and restore.
-    console.log(`[Gateway] ${savedMessages.length} messages in transcript.`);
+  // Restore agent context from transcript (survives restarts)
+  const restored = restoreSession(agent, session);
+  if (restored > 0) {
+    console.log(`[Gateway] Agent context restored with ${restored} messages.`);
   }
 
   // Connect WhatsApp (if configured)
