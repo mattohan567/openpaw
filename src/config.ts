@@ -41,7 +41,6 @@ export interface OpenPawConfig {
     port: number;
     host: string;
   };
-  tradingAgentsUrl: string; // URL to TradingAgents sidecar
   tradeLogFile: string;
 }
 
@@ -82,7 +81,6 @@ const DEFAULT_CONFIG: OpenPawConfig = {
     port: 18790,
     host: "127.0.0.1",
   },
-  tradingAgentsUrl: "http://127.0.0.1:8100",
   tradeLogFile: TRADE_LOG_PATH,
 };
 
