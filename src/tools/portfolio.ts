@@ -1,4 +1,5 @@
 import type { OpenPawConfig } from "../config.js";
+import { saveConfig } from "../config.js";
 import type { Tool } from "./types.js";
 
 function alpacaHeaders(config: OpenPawConfig) {
@@ -131,6 +132,65 @@ export function createPortfolioTools(config: OpenPawConfig): Tool[] {
           maxPortfolioRisk: config.trading.maxPortfolioRisk,
           paperTrading: config.trading.paperTrading,
         });
+      },
+    },
+    {
+      name: "add_to_watchlist",
+      description: "Add one or more ticker symbols to the watchlist. Persists to config.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          symbols: { type: "string", description: "Comma-separated ticker symbols to add (e.g. PLUG,AMC)" },
+        },
+        required: ["symbols"],
+      },
+      execute: async (params) => {
+        const newSymbols = (params.symbols as string)
+          .split(",")
+          .map((s) => s.trim().toUpperCase())
+          .filter(Boolean)
+          .filter((s) => !config.trading.watchlist.includes(s));
+
+        if (newSymbols.length === 0) {
+          return "All symbols already on watchlist.";
+        }
+
+        config.trading.watchlist.push(...newSymbols);
+        saveConfig(config);
+        return `Added ${newSymbols.join(", ")}. Watchlist: ${config.trading.watchlist.join(", ")}`;
+      },
+    },
+    {
+      name: "remove_from_watchlist",
+      description: "Remove one or more ticker symbols from the watchlist. Persists to config.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          symbols: { type: "string", description: "Comma-separated ticker symbols to remove (e.g. AAPL,MSFT)" },
+        },
+        required: ["symbols"],
+      },
+      execute: async (params) => {
+        const removeSymbols = (params.symbols as string)
+          .split(",")
+          .map((s) => s.trim().toUpperCase())
+          .filter(Boolean);
+
+        config.trading.watchlist = config.trading.watchlist.filter(
+          (s) => !removeSymbols.includes(s),
+        );
+        saveConfig(config);
+        return `Removed ${removeSymbols.join(", ")}. Watchlist: ${config.trading.watchlist.length ? config.trading.watchlist.join(", ") : "(empty)"}`;
+      },
+    },
+    {
+      name: "clear_watchlist",
+      description: "Remove all tickers from the watchlist.",
+      inputSchema: { type: "object" as const, properties: {} },
+      execute: async () => {
+        config.trading.watchlist = [];
+        saveConfig(config);
+        return "Watchlist cleared.";
       },
     },
   ];

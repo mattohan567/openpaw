@@ -61,9 +61,57 @@ export function createAlpacaTradingTools(config: OpenPawConfig): Tool[] {
         required: ["symbol", "qty"],
       },
       execute: async (params) => {
+        const symbol = (params.symbol as string).toUpperCase();
+        const qty = Number(params.qty);
+
+        // Pre-trade safety checks
+        const account = (await alpacaRequest(config, "/v2/account")) as Record<string, string>;
+        const buyingPower = Number(account.buying_power);
+        const portfolioValue = Number(account.portfolio_value);
+
+        // Estimate order cost
+        const quoteRes = (await fetch(`https://data.alpaca.markets/v2/stocks/${symbol}/quotes/latest`, {
+          headers: {
+            "APCA-API-KEY-ID": config.trading.alpacaApiKey,
+            "APCA-API-SECRET-KEY": config.trading.alpacaSecretKey,
+          },
+        }));
+        const quoteData = (await quoteRes.json()) as Record<string, Record<string, number>>;
+        const price = params.limit_price
+          ? Number(params.limit_price)
+          : quoteData.quote?.ap || quoteData.quote?.bp || 0;
+        const estimatedCost = price * qty;
+
+        // Check max position size
+        if (estimatedCost > config.trading.maxPositionSize) {
+          return `BLOCKED: Order ~$${estimatedCost.toFixed(0)} exceeds max position size of $${config.trading.maxPositionSize}. Reduce qty or adjust config.`;
+        }
+
+        // Check buying power
+        if (estimatedCost > buyingPower) {
+          return `BLOCKED: Order ~$${estimatedCost.toFixed(0)} exceeds available buying power of $${buyingPower}. You can't afford this trade.`;
+        }
+
+        // Check portfolio concentration
+        if (portfolioValue > 0) {
+          // Get existing position in this stock
+          let existingValue = 0;
+          try {
+            const pos = (await alpacaRequest(config, `/v2/positions/${symbol}`)) as Record<string, string>;
+            existingValue = Number(pos.market_value) || 0;
+          } catch {
+            // No existing position
+          }
+          const totalExposure = existingValue + estimatedCost;
+          const concentration = totalExposure / portfolioValue;
+          if (concentration > config.trading.maxPortfolioRisk) {
+            return `BLOCKED: This would put ${(concentration * 100).toFixed(0)}% of portfolio in ${symbol} (max ${(config.trading.maxPortfolioRisk * 100).toFixed(0)}%). Total exposure: $${totalExposure.toFixed(0)} of $${portfolioValue.toFixed(0)} portfolio.`;
+          }
+        }
+
         const order: Record<string, unknown> = {
-          symbol: (params.symbol as string).toUpperCase(),
-          qty: String(params.qty),
+          symbol,
+          qty: String(qty),
           side: "buy",
           type: (params.order_type as string) || "market",
           time_in_force: (params.time_in_force as string) || "day",
@@ -72,7 +120,7 @@ export function createAlpacaTradingTools(config: OpenPawConfig): Tool[] {
         if (params.stop_price) order.stop_price = String(params.stop_price);
 
         const result = await alpacaRequest(config, "/v2/orders", "POST", order);
-        logTrade(config, { action: "buy", ...order, result });
+        logTrade(config, { action: "buy", ...order, estimatedCost, buyingPower, portfolioValue, result });
         return JSON.stringify(result);
       },
     },
@@ -146,6 +194,103 @@ export function createAlpacaTradingTools(config: OpenPawConfig): Tool[] {
       execute: async (params) => {
         await alpacaRequest(config, `/v2/orders/${params.order_id}`, "DELETE");
         return `Order ${params.order_id} cancelled.`;
+      },
+    },
+    {
+      name: "bracket_order",
+      description:
+        "Place a buy order with automatic take-profit and stop-loss. Alpaca executes the exits server-side — no need for the agent to be awake. Use time_in_force 'gtc' (good till cancelled) so the exit orders persist across trading days.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          symbol: { type: "string", description: "Stock ticker symbol" },
+          qty: { type: "number", description: "Number of shares to buy" },
+          take_profit: { type: "number", description: "Take-profit price — sell when stock reaches this price" },
+          stop_loss: { type: "number", description: "Stop-loss price — sell if stock drops to this price" },
+          limit_price: { type: "number", description: "Limit price for the buy (omit for market order)" },
+        },
+        required: ["symbol", "qty", "take_profit", "stop_loss"],
+      },
+      execute: async (params) => {
+        const symbol = (params.symbol as string).toUpperCase();
+        const qty = Number(params.qty);
+        const takeProfit = Number(params.take_profit);
+        const stopLoss = Number(params.stop_loss);
+
+        // Same pre-trade checks as buy_stock
+        const account = (await alpacaRequest(config, "/v2/account")) as Record<string, string>;
+        const buyingPower = Number(account.buying_power);
+        const portfolioValue = Number(account.portfolio_value);
+
+        const quoteRes = await fetch(`https://data.alpaca.markets/v2/stocks/${symbol}/quotes/latest`, {
+          headers: {
+            "APCA-API-KEY-ID": config.trading.alpacaApiKey,
+            "APCA-API-SECRET-KEY": config.trading.alpacaSecretKey,
+          },
+        });
+        const quoteData = (await quoteRes.json()) as Record<string, Record<string, number>>;
+        const price = params.limit_price
+          ? Number(params.limit_price)
+          : quoteData.quote?.ap || quoteData.quote?.bp || 0;
+        const estimatedCost = price * qty;
+
+        if (estimatedCost > config.trading.maxPositionSize) {
+          return `BLOCKED: ~$${estimatedCost.toFixed(0)} exceeds max position size $${config.trading.maxPositionSize}.`;
+        }
+        if (estimatedCost > buyingPower) {
+          return `BLOCKED: ~$${estimatedCost.toFixed(0)} exceeds buying power $${buyingPower}.`;
+        }
+        if (portfolioValue > 0) {
+          let existingValue = 0;
+          try {
+            const pos = (await alpacaRequest(config, `/v2/positions/${symbol}`)) as Record<string, string>;
+            existingValue = Number(pos.market_value) || 0;
+          } catch {}
+          const concentration = (existingValue + estimatedCost) / portfolioValue;
+          if (concentration > config.trading.maxPortfolioRisk) {
+            return `BLOCKED: Would put ${(concentration * 100).toFixed(0)}% of portfolio in ${symbol} (max ${(config.trading.maxPortfolioRisk * 100).toFixed(0)}%).`;
+          }
+        }
+
+        const order: Record<string, unknown> = {
+          symbol,
+          qty: String(qty),
+          side: "buy",
+          type: params.limit_price ? "limit" : "market",
+          time_in_force: "gtc",
+          order_class: "bracket",
+          take_profit: { limit_price: String(takeProfit) },
+          stop_loss: { stop_price: String(stopLoss) },
+        };
+        if (params.limit_price) order.limit_price = String(params.limit_price);
+
+        const result = await alpacaRequest(config, "/v2/orders", "POST", order);
+        logTrade(config, {
+          action: "bracket_buy",
+          ...order,
+          estimatedCost,
+          takeProfit,
+          stopLoss,
+          result,
+        });
+        return JSON.stringify(result);
+      },
+    },
+    {
+      name: "get_market_calendar",
+      description: "Get market calendar — check if the market is open on specific dates, early close days, and holidays.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          start: { type: "string", description: "Start date YYYY-MM-DD (default: today)" },
+          end: { type: "string", description: "End date YYYY-MM-DD (default: 10 days from start)" },
+        },
+      },
+      execute: async (params) => {
+        const start = (params.start as string) || new Date().toISOString().split("T")[0];
+        const end = (params.end as string) || new Date(Date.now() + 10 * 86400000).toISOString().split("T")[0];
+        const result = await alpacaRequest(config, `/v2/calendar?start=${start}&end=${end}`);
+        return JSON.stringify(result);
       },
     },
   ];

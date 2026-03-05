@@ -21,6 +21,17 @@ async function dataRequest(config: OpenPawConfig, path: string): Promise<unknown
   return res.json();
 }
 
+async function alpacaScreener(config: OpenPawConfig, path: string): Promise<unknown> {
+  const res = await fetch(`https://paper-api.alpaca.markets${path}`, {
+    headers: dataHeaders(config),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Alpaca Screener ${path}: ${res.status} ${text}`);
+  }
+  return res.json();
+}
+
 export function createMarketDataTools(config: OpenPawConfig): Tool[] {
   return [
     {
@@ -100,6 +111,78 @@ export function createMarketDataTools(config: OpenPawConfig): Tool[] {
         if (params.symbols) path += `symbols=${params.symbols}&`;
         path += `limit=${(params.limit as number) || 10}`;
         const result = await dataRequest(config, path);
+        return JSON.stringify(result);
+      },
+    },
+    {
+      name: "get_top_movers",
+      description:
+        "Get the top market movers — stocks with the biggest price changes. Use this to discover stocks with momentum. Returns top gainers and losers by percentage change.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          type: {
+            type: "string",
+            description: "Type of movers: 'gainers' or 'losers' (default: gainers)",
+          },
+          top: {
+            type: "number",
+            description: "Number of results (default: 20)",
+          },
+        },
+      },
+      execute: async (params) => {
+        const type = (params.type as string) || "gainers";
+        const top = (params.top as number) || 20;
+        // Alpaca movers endpoint
+        const result = await dataRequest(config, `/v1beta1/screener/stocks/movers?top=${top}`);
+        const data = result as Record<string, unknown>;
+        // Return just the requested type
+        if (type === "losers") return JSON.stringify(data.losers || data);
+        return JSON.stringify(data.gainers || data);
+      },
+    },
+    {
+      name: "get_most_active",
+      description:
+        "Get the most actively traded stocks by volume. Great for finding stocks with high liquidity and interest.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          top: {
+            type: "number",
+            description: "Number of results (default: 20)",
+          },
+          by: {
+            type: "string",
+            description: "Sort by 'volume' or 'trades' (default: volume)",
+          },
+        },
+      },
+      execute: async (params) => {
+        const top = (params.top as number) || 20;
+        const by = (params.by as string) || "volume";
+        const result = await dataRequest(config, `/v1beta1/screener/stocks/most-actives?top=${top}&by=${by}`);
+        return JSON.stringify(result);
+      },
+    },
+    {
+      name: "screen_stocks",
+      description:
+        "Get snapshots for multiple stocks at once. Use this to compare a batch of tickers — returns latest trade, quote, daily bar, and prev bar for each. Pass up to 50 symbols.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          symbols: {
+            type: "string",
+            description: "Comma-separated ticker symbols (e.g. PLUG,AMC,SNDL,MARA,RIOT)",
+          },
+        },
+        required: ["symbols"],
+      },
+      execute: async (params) => {
+        const symbols = (params.symbols as string).toUpperCase();
+        const result = await dataRequest(config, `/v2/stocks/snapshots?symbols=${symbols}`);
         return JSON.stringify(result);
       },
     },
