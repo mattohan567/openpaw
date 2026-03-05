@@ -21,6 +21,7 @@ import type { Agent } from "@mariozechner/pi-agent-core";
 import { openSession, type SessionStore } from "./session.js";
 import { startHeartbeat, startMarketOpenJob, startMarketCloseJob } from "./cron.js";
 import { AlpacaStream } from "./streaming.js";
+import { startSidecars, stopSidecars } from "./sidecars.js";
 
 export interface GatewayServer {
   httpServer: Server;
@@ -65,6 +66,9 @@ export async function startGateway(): Promise<GatewayServer> {
   console.log("[Gateway] Starting OpenPaw...");
   console.log(`[Gateway] Port: ${config.gateway.port}`);
   console.log(`[Gateway] Paper trading: ${config.trading.paperTrading}`);
+
+  // Start Python sidecars (quant-analysis, backtesting)
+  await startSidecars();
 
   // Start real-time market data stream
   let stream: AlpacaStream | null = null;
@@ -310,6 +314,7 @@ export async function startGateway(): Promise<GatewayServer> {
     marketOpenJob?.stop();
     marketCloseJob?.stop();
     if (stream) stream.close();
+    stopSidecars();
     wss.close();
     httpServer.close();
     if (whatsapp) await whatsapp.close();

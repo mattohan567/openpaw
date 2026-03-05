@@ -9,6 +9,7 @@ import { createResearchTools } from "./research.js";
 import { createMemoryTools } from "../memory.js";
 import { createAlertTools } from "./alerts.js";
 import { createRiskTools } from "./risk-tools.js";
+import { createQuantTools } from "./quant.js";
 
 export function createOpenPawTools(
   config: OpenPawConfig,
@@ -22,6 +23,7 @@ export function createOpenPawTools(
     ...createResearchTools(config),
     ...createAlertTools(stream ?? null),
     ...createRiskTools(config),
+    ...createQuantTools(),
     ...createMemoryTools(),
   ];
 }
