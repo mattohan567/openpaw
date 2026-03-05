@@ -1,4 +1,5 @@
-import makeWASocket, {
+import {
+  makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
@@ -22,7 +23,10 @@ export async function connectWhatsApp(config: OpenPawConfig): Promise<WhatsAppCl
   const { version } = await fetchLatestBaileysVersion();
 
   let messageHandler: ((text: string) => Promise<void>) | null = null;
-  let sock: WASocket;
+  let sock!: WASocket;
+  let onConnected: (() => void) | null = null;
+  // Track message IDs sent by the bot so we don't respond to our own replies
+  const sentMessageIds = new Set<string>();
 
   function createSocket(): WASocket {
     sock = makeWASocket({
@@ -48,27 +52,37 @@ export async function connectWhatsApp(config: OpenPawConfig): Promise<WhatsAppCl
 
         if (shouldReconnect) {
           setTimeout(() => {
-            sock = createSocket();
+            createSocket();
           }, 3000);
         }
       }
 
       if (connection === "open") {
         console.log("[WhatsApp] Connected successfully.");
+        if (onConnected) {
+          onConnected();
+          onConnected = null;
+        }
       }
     });
 
     // Listen for incoming messages - only from owner
+    const ownerJid = config.whatsapp.ownerNumber.replace("+", "") + "@s.whatsapp.net";
     sock.ev.on("messages.upsert", async ({ messages }) => {
       for (const msg of messages) {
-        if (!msg.message || msg.key.fromMe) continue;
+        if (!msg.message) continue;
 
-        // Only process messages from the owner
         const sender = msg.key.remoteJid;
         if (!sender) continue;
 
-        const ownerJid = config.whatsapp.ownerNumber.replace("+", "") + "@s.whatsapp.net";
+        // Only process messages from the owner's JID
         if (sender !== ownerJid) continue;
+
+        // Skip messages the bot itself sent (avoid echo loop)
+        if (msg.key.id && sentMessageIds.has(msg.key.id)) {
+          sentMessageIds.delete(msg.key.id);
+          continue;
+        }
 
         // Extract text
         const text =
@@ -100,17 +114,15 @@ export async function connectWhatsApp(config: OpenPawConfig): Promise<WhatsAppCl
     return sock;
   }
 
-  sock = createSocket();
+  createSocket();
 
-  // Wait for connection
+  // Wait for connection (works across reconnects since onConnected is global)
   await new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("WhatsApp connection timeout")), 60_000);
-    sock.ev.on("connection.update", ({ connection }) => {
-      if (connection === "open") {
-        clearTimeout(timeout);
-        resolve();
-      }
-    });
+    const timeout = setTimeout(() => reject(new Error("WhatsApp connection timeout")), 120_000);
+    onConnected = () => {
+      clearTimeout(timeout);
+      resolve();
+    };
   });
 
   const ownerJid = config.whatsapp.ownerNumber.replace("+", "") + "@s.whatsapp.net";
@@ -121,7 +133,8 @@ export async function connectWhatsApp(config: OpenPawConfig): Promise<WhatsAppCl
       // Chunk long messages (WhatsApp limit ~4000 chars for comfortable reading)
       const chunks = chunkText(text, 4000);
       for (const chunk of chunks) {
-        await sock.sendMessage(ownerJid, { text: chunk });
+        const sent = await sock.sendMessage(ownerJid, { text: chunk });
+        if (sent?.key?.id) sentMessageIds.add(sent.key.id);
       }
     },
     onMessage: (handler) => {
