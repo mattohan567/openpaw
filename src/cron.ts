@@ -1,11 +1,10 @@
 /**
- * Cron/heartbeat system - scheduled market checks.
+ * Cron/heartbeat system - scheduled market checks and off-hours research.
  *
- * Like OpenClaw's cron system:
- * - Heartbeat runs every N minutes during market hours
- * - Market open job runs at 9:30 AM ET
- * - Market close job runs at 4:05 PM ET
- * - Each job runs a full agent turn and sends results via WhatsApp
+ * Heartbeats run all the time but do different things:
+ * - During market hours: check positions, P&L, movers, news
+ * - Off-hours: research, plan next day, review memory, analyze watchlist
+ * - Market open/close: special briefings
  */
 
 import { CronJob } from "cron";
@@ -23,21 +22,41 @@ export interface HeartbeatContext {
   session: SessionStore;
 }
 
+function isQuietHours(): boolean {
+  const now = new Date();
+  const eastern = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const hour = eastern.getHours();
+  // 11 PM - 7 AM ET = quiet hours (no heartbeats at all)
+  return hour >= 23 || hour < 7;
+}
+
 export function startHeartbeat(ctx: HeartbeatContext): CronJob {
   const interval = ctx.config.cron.heartbeatMinutes;
 
   const job = new CronJob(`*/${interval} * * * *`, async () => {
-    if (ctx.config.trading.tradingHoursOnly && !isMarketHours()) {
-      return;
-    }
+    // Respect quiet hours — don't burn API credits overnight
+    if (isQuietHours()) return;
 
-    console.log(`[Heartbeat] Running at ${new Date().toISOString()}`);
+    const marketOpen = isMarketHours();
+    const prompt = marketOpen
+      ? loadHeartbeatPrompt()
+      : `Off-hours research. Market is closed — use this time to find tomorrow's plays:
+- Use get_top_movers and get_most_active to see what moved today
+- Check news for after-hours catalysts, earnings surprises, FDA decisions, short squeeze setups
+- Look for penny stocks (under $5) with unusual volume or big % moves
+- Research any promising tickers with get_bars to check the chart pattern
+- Update your watchlist with anything worth watching at open
+- Review and consolidate your memory
+
+Only message the owner if you found something genuinely actionable for tomorrow. Save all research to daily memory either way. Respond with empty text if nothing notable.`;
+
+    console.log(`[Heartbeat] Running at ${new Date().toISOString()} (market ${marketOpen ? "open" : "closed"})`);
 
     try {
       const result = await runAgentTurn(
         ctx.agent,
         ctx.session,
-        loadHeartbeatPrompt(),
+        prompt,
         ctx.config,
       );
 
@@ -50,7 +69,7 @@ export function startHeartbeat(ctx: HeartbeatContext): CronJob {
   });
 
   job.start();
-  console.log(`[Heartbeat] Every ${interval}min${ctx.config.trading.tradingHoursOnly ? " (market hours)" : ""}.`);
+  console.log(`[Heartbeat] Every ${interval}min (quiet hours 11PM-7AM ET skipped).`);
   return job;
 }
 
@@ -65,11 +84,11 @@ export function startMarketOpenJob(ctx: HeartbeatContext): CronJob | null {
         const result = await runAgentTurn(
           ctx.agent,
           ctx.session,
-          "The market just opened. Check the portfolio, scan the watchlist for any pre-market movers, and check overnight news for our holdings. Give me a brief morning briefing. Save a summary to today's daily log.",
+          "Market just opened. Check the portfolio, scan watchlist for pre-market movers, check overnight news on our holdings. Send me a brief morning briefing. Save a summary to today's daily log.",
           ctx.config,
         );
         if (result.response.trim()) {
-          await ctx.sendWhatsApp(`*Morning Briefing*\n\n${result.response}`);
+          await ctx.sendWhatsApp(result.response);
         }
       } catch (err) {
         console.error("[Cron] Market open error:", err);
@@ -96,11 +115,11 @@ export function startMarketCloseJob(ctx: HeartbeatContext): CronJob | null {
         const result = await runAgentTurn(
           ctx.agent,
           ctx.session,
-          "The market just closed. Give me an end-of-day report: portfolio P&L for today, any trades executed, notable movers in our watchlist, and any after-hours news. Save the report to today's daily log and update curated memory with any new insights.",
+          "Market just closed. End-of-day report: portfolio P&L today, trades executed, notable movers on watchlist, any after-hours news. Save the report to daily log and update curated memory with new insights.",
           ctx.config,
         );
         if (result.response.trim()) {
-          await ctx.sendWhatsApp(`*End of Day Report*\n\n${result.response}`);
+          await ctx.sendWhatsApp(result.response);
         }
       } catch (err) {
         console.error("[Cron] Market close error:", err);
@@ -115,4 +134,3 @@ export function startMarketCloseJob(ctx: HeartbeatContext): CronJob | null {
   console.log("[Cron] Market close: 4:05 PM ET, Mon-Fri.");
   return job;
 }
-

@@ -64,34 +64,23 @@ export async function startGateway(): Promise<GatewayServer> {
 
       // Wire up: incoming WhatsApp messages → agent → streaming reply
       whatsapp.onMessage(async (text: string) => {
-        console.log(`[WhatsApp] Message from owner: ${text.slice(0, 100)}`);
-
-        // Collect streamed text for WhatsApp (send at sentence boundaries)
-        let streamBuffer = "";
+        console.log(`\n[WhatsApp] >>> Owner: ${text}`);
 
         try {
           const result = await runAgentTurn(agent, session, text, config, {
             onTextDelta: (delta) => {
-              streamBuffer += delta;
-
-              // Send chunks at paragraph boundaries for WhatsApp readability
-              const lastBreak = streamBuffer.lastIndexOf("\n\n");
-              if (lastBreak > 100) {
-                const chunk = streamBuffer.slice(0, lastBreak);
-                streamBuffer = streamBuffer.slice(lastBreak);
-                whatsapp!.sendMessage(chunk.trim()).catch(console.error);
-              }
+              // Stream to terminal only, not WhatsApp
+              process.stdout.write(delta);
             },
             onToolUse: (toolName) => {
-              console.log(`[Agent] Using tool: ${toolName}`);
+              console.log(`\n[Agent] Using tool: ${toolName}`);
             },
           });
 
-          // Send any remaining text
-          if (streamBuffer.trim()) {
-            await whatsapp!.sendMessage(streamBuffer.trim());
-          } else if (result.response.trim() && !streamBuffer) {
-            // Fallback: send full response if streaming didn't produce chunks
+          console.log(`\n[Agent] Done. Tools used: ${result.toolsUsed.length ? result.toolsUsed.join(", ") : "none"}`);
+
+          // Send only the final response to WhatsApp
+          if (result.response.trim()) {
             await whatsapp!.sendMessage(result.response);
           }
         } catch (err) {
