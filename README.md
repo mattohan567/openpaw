@@ -2,7 +2,7 @@
 
 Autonomous stock trading agent that runs on your computer 24/7. Screens markets, analyzes stocks with quantitative models, backtests strategies, manages risk, executes trades via Alpaca, and keeps you in the loop via WhatsApp.
 
-Built on the same [Pi SDK](https://github.com/nicepkg/pi-agent) agent engine as [OpenClaw](https://github.com/nicepkg/openclaw).
+Built on the same [Pi SDK](https://github.com/badlogic/pi-mono) agent engine as [OpenClaw](https://github.com/openclaw/openclaw).
 
 ## What It Does
 
