@@ -175,10 +175,12 @@ export function buildSystemPrompt(config: OpenPawConfig): string {
 
 /**
  * Create the Pi SDK Agent with context management (compaction).
+ * Pass sessionStore so compaction also trims the on-disk transcript.
  */
 export function createAgent(
   tools: Tool[],
   config: OpenPawConfig,
+  sessionStore?: SessionStore,
 ): Agent {
   const model = resolveModel(config);
   const piTools = tools.map(toPiTool);
@@ -201,8 +203,14 @@ export function createAgent(
       const estimate = JSON.stringify(messages).length / 4;
 
       if (estimate > COMPACTION_TOKEN_THRESHOLD) {
-        console.log(`[Agent] Context at ~${Math.round(estimate)}k tokens, compacting...`);
-        return compactMessages(messages);
+        console.log(`[Agent] Context at ~${Math.round(estimate / 1000)}k tokens, compacting...`);
+        const compacted = compactMessages(messages);
+        // Also compact the on-disk transcript to prevent unbounded growth
+        if (sessionStore) {
+          sessionStore.compact(compacted);
+          console.log(`[Agent] Transcript compacted to ${compacted.length} messages.`);
+        }
+        return compacted;
       }
 
       return messages;

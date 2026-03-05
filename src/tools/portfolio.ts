@@ -2,6 +2,8 @@ import type { OpenPawConfig } from "../config.js";
 import { saveConfig } from "../config.js";
 import type { Tool } from "./types.js";
 
+const SAFE_SYMBOL = /^[A-Z0-9._-]+$/;
+
 function alpacaHeaders(config: OpenPawConfig) {
   return {
     "APCA-API-KEY-ID": config.trading.alpacaApiKey,
@@ -63,6 +65,7 @@ export function createPortfolioTools(config: OpenPawConfig): Tool[] {
       },
       execute: async (params) => {
         const symbol = (params.symbol as string).toUpperCase();
+        if (!SAFE_SYMBOL.test(symbol)) return "Invalid symbol.";
         try {
           const position = await alpacaRequest(config, `/v2/positions/${symbol}`);
           return JSON.stringify(position);
@@ -83,6 +86,7 @@ export function createPortfolioTools(config: OpenPawConfig): Tool[] {
       },
       execute: async (params) => {
         const symbol = (params.symbol as string).toUpperCase();
+        if (!SAFE_SYMBOL.test(symbol)) return "Invalid symbol.";
         const res = await fetch(`${config.trading.alpacaBaseUrl}/v2/positions/${symbol}`, {
           method: "DELETE",
           headers: alpacaHeaders(config),

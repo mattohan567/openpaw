@@ -22,11 +22,15 @@ function alpacaHeaders(config: OpenPawConfig) {
 }
 
 export function createRiskTools(config: OpenPawConfig): Tool[] {
-  const riskConfig: RiskConfig = {
-    ...DEFAULT_RISK_CONFIG,
-    maxPositionSize: config.trading.maxPositionSize,
-    maxPortfolioRisk: config.trading.maxPortfolioRisk,
-  };
+  // Read from config at execution time so runtime changes are reflected
+  function getRiskConfig(): RiskConfig {
+    return {
+      ...DEFAULT_RISK_CONFIG,
+      ...config.risk,
+      maxPositionSize: config.trading.maxPositionSize,
+      maxPortfolioRisk: config.trading.maxPortfolioRisk,
+    };
+  }
 
   return [
     {
@@ -47,7 +51,7 @@ export function createRiskTools(config: OpenPawConfig): Tool[] {
           const account = (await accountRes.json()) as Record<string, unknown>;
           const positions = (await positionsRes.json()) as Record<string, unknown>[];
 
-          const risk = assessPortfolioRisk(account, positions, riskConfig);
+          const risk = assessPortfolioRisk(account, positions, getRiskConfig());
           return formatRiskReport(risk);
         } catch (err) {
           return `Risk assessment failed: ${err instanceof Error ? err.message : "unknown error"}`;
@@ -82,7 +86,7 @@ export function createRiskTools(config: OpenPawConfig): Tool[] {
           const account = (await accountRes.json()) as Record<string, unknown>;
           const positions = (await positionsRes.json()) as Record<string, unknown>[];
 
-          const check = preTradeRiskCheck(symbol, estimatedCost, account, positions, riskConfig);
+          const check = preTradeRiskCheck(symbol, estimatedCost, account, positions, getRiskConfig());
 
           const parts: string[] = [];
           if (check.blocks.length > 0) {

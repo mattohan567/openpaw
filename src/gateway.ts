@@ -95,11 +95,11 @@ export async function startGateway(): Promise<GatewayServer> {
   const tools = createOpenPawTools(config, stream);
   console.log(`[Gateway] ${tools.length} tools registered.`);
 
-  // Create Pi SDK agent (same engine as OpenClaw)
-  const agent = createAgent(tools, config);
-
   // Open persistent session (JSONL transcript)
   const session = openSession("main");
+
+  // Create Pi SDK agent (same engine as OpenClaw), pass session for disk compaction
+  const agent = createAgent(tools, config, session);
   console.log(`[Gateway] Session opened (${session.turnCount} entries in transcript).`);
 
   // Restore agent context from transcript (survives restarts)

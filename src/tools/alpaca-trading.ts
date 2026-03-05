@@ -2,6 +2,13 @@ import type { OpenPawConfig } from "../config.js";
 import type { Tool } from "./types.js";
 import { appendFileSync } from "node:fs";
 
+/** Validate URL path segments to prevent path traversal */
+const SAFE_ID = /^[a-zA-Z0-9._-]+$/;
+function validateId(value: string, label: string): string | null {
+  if (!SAFE_ID.test(value)) return `Invalid ${label}: contains unsafe characters.`;
+  return null;
+}
+
 function alpacaHeaders(config: OpenPawConfig) {
   return {
     "APCA-API-KEY-ID": config.trading.alpacaApiKey,
@@ -155,9 +162,23 @@ export function createAlpacaTradingTools(config: OpenPawConfig): Tool[] {
         required: ["symbol", "qty"],
       },
       execute: async (params) => {
+        const symbol = (params.symbol as string).toUpperCase();
+        const qty = Number(params.qty);
+
+        // Validate we actually hold enough shares
+        try {
+          const pos = (await alpacaRequest(config, `/v2/positions/${symbol}`)) as Record<string, string>;
+          const held = Number(pos.qty) || 0;
+          if (qty > held) {
+            return `BLOCKED: Trying to sell ${qty} shares of ${symbol} but only holding ${held}.`;
+          }
+        } catch {
+          return `BLOCKED: No open position in ${symbol}. Nothing to sell.`;
+        }
+
         const order: Record<string, unknown> = {
-          symbol: (params.symbol as string).toUpperCase(),
-          qty: String(params.qty),
+          symbol,
+          qty: String(qty),
           side: "sell",
           type: (params.order_type as string) || "market",
           time_in_force: (params.time_in_force as string) || "day",
@@ -198,8 +219,11 @@ export function createAlpacaTradingTools(config: OpenPawConfig): Tool[] {
         required: ["order_id"],
       },
       execute: async (params) => {
-        await alpacaRequest(config, `/v2/orders/${params.order_id}`, "DELETE");
-        return `Order ${params.order_id} cancelled.`;
+        const orderId = params.order_id as string;
+        const err = validateId(orderId, "order_id");
+        if (err) return err;
+        await alpacaRequest(config, `/v2/orders/${orderId}`, "DELETE");
+        return `Order ${orderId} cancelled.`;
       },
     },
     {
