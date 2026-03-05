@@ -24,6 +24,7 @@ import type {
 import { streamSimple, getModel, getEnvApiKey } from "@mariozechner/pi-ai";
 import type { Model, AssistantMessage as PiAssistantMessage } from "@mariozechner/pi-ai";
 import { Type } from "@mariozechner/pi-ai";
+import { generateSummary, estimateTokens } from "@mariozechner/pi-coding-agent";
 import { readFileSync, existsSync } from "node:fs";
 import type { OpenPawConfig } from "./config.js";
 import { STATE_DIR } from "./config.js";
@@ -31,6 +32,9 @@ import { join } from "node:path";
 import type { Tool } from "./tools/types.js";
 import type { SessionStore } from "./session.js";
 import { loadCuratedMemory, loadTodayLog } from "./memory.js";
+import { createSubsystemLogger } from "./logger.js";
+
+const log = createSubsystemLogger("Agent");
 
 export type { AgentEvent, AgentMessage };
 
@@ -41,10 +45,28 @@ export interface AgentRunResult {
 
 // Compaction threshold - ~120k tokens leaves room for response in 200k context
 const COMPACTION_TOKEN_THRESHOLD = 120_000;
+// Max characters for a single tool result before truncation (~10k tokens)
+const MAX_TOOL_RESULT_CHARS = 40_000;
+// Reserve tokens for the summarization response
+const SUMMARY_RESERVE_TOKENS = 4096;
 
 /**
  * Convert our simple Tool interface to Pi SDK's AgentTool interface.
  */
+/**
+ * Truncate oversized tool results to prevent context blowouts.
+ * Like OpenClaw's tool result context guards — caps output at MAX_TOOL_RESULT_CHARS.
+ */
+function truncateToolResult(text: string, toolName: string): string {
+  if (text.length <= MAX_TOOL_RESULT_CHARS) return text;
+
+  const truncated = text.slice(0, MAX_TOOL_RESULT_CHARS);
+  const droppedChars = text.length - MAX_TOOL_RESULT_CHARS;
+  log.warn(`Tool ${toolName} result truncated: ${text.length} → ${MAX_TOOL_RESULT_CHARS} chars (dropped ${droppedChars})`);
+
+  return truncated + `\n\n[... truncated ${droppedChars} characters. Result was too large for context. Ask for specific data instead of full dumps.]`;
+}
+
 function toPiTool(tool: Tool): AgentTool<any> {
   const schema = Type.Object(
     Object.fromEntries(
@@ -74,7 +96,8 @@ function toPiTool(tool: Tool): AgentTool<any> {
       try {
         const params = (input ?? {}) as Record<string, unknown>;
         const result = await tool.execute(params);
-        const text = typeof result === "string" ? result : JSON.stringify(result);
+        const raw = typeof result === "string" ? result : JSON.stringify(result);
+        const text = truncateToolResult(raw, tool.name);
         return {
           content: [{ type: "text", text }],
           details: result,
@@ -197,18 +220,17 @@ export function createAgent(
     getApiKey: async (provider: string) => {
       return getEnvApiKey(provider) ?? undefined;
     },
-    // Context management - like OpenClaw's compaction
+    // Context management - like OpenClaw's compaction with LLM summarization
     transformContext: async (messages: AgentMessage[]) => {
-      // Rough token estimate: stringify and divide by 4
-      const estimate = JSON.stringify(messages).length / 4;
+      const estimate = messages.reduce((sum, m) => sum + estimateTokens(m), 0);
 
       if (estimate > COMPACTION_TOKEN_THRESHOLD) {
-        console.log(`[Agent] Context at ~${Math.round(estimate / 1000)}k tokens, compacting...`);
-        const compacted = compactMessages(messages);
+        log.info(`Context at ~${Math.round(estimate / 1000)}k tokens, compacting...`);
+        const compacted = await compactMessages(messages, model, config);
         // Also compact the on-disk transcript to prevent unbounded growth
         if (sessionStore) {
           sessionStore.compact(compacted);
-          console.log(`[Agent] Transcript compacted to ${compacted.length} messages.`);
+          log.info(`Transcript compacted to ${compacted.length} messages.`);
         }
         return compacted;
       }
@@ -236,50 +258,49 @@ export function restoreSession(agent: Agent, sessionStore: SessionStore): number
 
 /**
  * Compact messages when context gets too large.
- * Keeps the first few messages (identity/context) and recent messages,
- * summarizes the middle.
+ * Uses LLM-based summarization (like OpenClaw) to create a high-quality
+ * summary of older messages, preserving recent context.
+ *
+ * Falls back to heuristic extraction if LLM summarization fails.
  */
-function compactMessages(messages: AgentMessage[]): AgentMessage[] {
+async function compactMessages(
+  messages: AgentMessage[],
+  model: Model<any>,
+  config: OpenPawConfig,
+): Promise<AgentMessage[]> {
   if (messages.length <= 10) return messages;
 
-  // Keep first 2 messages (usually initial context) and last 8 (recent activity)
+  // Keep first 2 messages (identity/context) and last 8 (recent activity)
   const keepFirst = 2;
   const keepLast = 8;
   const middle = messages.slice(keepFirst, -keepLast);
 
-  // Build a summary of the middle messages
-  const summaryParts: string[] = ["[Previous conversation compacted. Key context preserved below.]", ""];
+  if (middle.length === 0) return messages;
 
-  for (const msg of middle) {
-    if ("role" in msg) {
-      const m = msg as any;
-      if (m.role === "user" && typeof m.content === "string") {
-        // Summarize user messages briefly
-        const text = m.content as string;
-        if (text.length > 200) {
-          summaryParts.push(`User: ${text.slice(0, 200)}...`);
-        }
-      } else if (m.role === "assistant" && Array.isArray(m.content)) {
-        // Extract key decisions from assistant messages
-        for (const block of m.content) {
-          if (block.type === "text" && typeof block.text === "string") {
-            const text = block.text as string;
-            // Keep lines mentioning trades, positions, or decisions
-            const importantLines = text.split("\n").filter((line: string) =>
-              /\b(bought|sold|buy|sell|position|portfolio|P&?L|alert|warning|risk)\b/i.test(line),
-            );
-            if (importantLines.length > 0) {
-              summaryParts.push(...importantLines.slice(0, 5));
-            }
-          }
-        }
-      }
-    }
+  // Strip tool result details from middle messages before summarization (security + size)
+  const safeMiddle = stripToolResultDetails(middle);
+
+  // Try LLM-based summarization (like OpenClaw's generateSummary)
+  let summaryText: string;
+  try {
+    const apiKey = getEnvApiKey(config.agent.provider) ?? "";
+    summaryText = await generateSummary(
+      safeMiddle,
+      model,
+      SUMMARY_RESERVE_TOKENS,
+      apiKey,
+      undefined, // no abort signal
+      COMPACTION_INSTRUCTIONS,
+    );
+    log.info(`LLM summarization succeeded (${middle.length} messages → summary).`);
+  } catch (err) {
+    log.warn(`LLM summarization failed, using heuristic fallback: ${err instanceof Error ? err.message : String(err)}`);
+    summaryText = heuristicSummary(middle);
   }
 
   const summaryMessage: AgentMessage = {
     role: "user",
-    content: summaryParts.join("\n"),
+    content: `[Previous conversation compacted via summarization]\n\n${summaryText}`,
     timestamp: Date.now(),
   };
 
@@ -289,6 +310,82 @@ function compactMessages(messages: AgentMessage[]): AgentMessage[] {
     ...messages.slice(-keepLast),
   ];
 }
+
+/**
+ * Strip verbose details from tool results before feeding to summarization.
+ * Prevents untrusted/huge payloads from entering the compaction prompt.
+ */
+function stripToolResultDetails(messages: AgentMessage[]): AgentMessage[] {
+  return messages.map((msg) => {
+    const m = msg as any;
+    if (m.role === "tool" && m.content) {
+      // Truncate tool result content if oversized
+      if (typeof m.content === "string" && m.content.length > 2000) {
+        return { ...m, content: m.content.slice(0, 2000) + "\n[...truncated for compaction]" };
+      }
+      if (Array.isArray(m.content)) {
+        return {
+          ...m,
+          content: m.content.map((block: any) => {
+            if (block.type === "text" && typeof block.text === "string" && block.text.length > 2000) {
+              return { ...block, text: block.text.slice(0, 2000) + "\n[...truncated for compaction]" };
+            }
+            return block;
+          }),
+        };
+      }
+    }
+    return msg;
+  });
+}
+
+/**
+ * Heuristic fallback when LLM summarization fails.
+ * Extracts trading-relevant lines from the conversation.
+ */
+function heuristicSummary(messages: AgentMessage[]): string {
+  const parts: string[] = [];
+
+  for (const msg of messages) {
+    const m = msg as any;
+    if (m.role === "user" && typeof m.content === "string") {
+      if (m.content.length > 200) {
+        parts.push(`User: ${m.content.slice(0, 200)}...`);
+      }
+    } else if (m.role === "assistant" && Array.isArray(m.content)) {
+      for (const block of m.content) {
+        if (block.type === "text" && typeof block.text === "string") {
+          const importantLines = (block.text as string).split("\n").filter((line: string) =>
+            /\b(bought|sold|buy|sell|position|portfolio|P&?L|alert|warning|risk|stop.?loss|take.?profit|bracket)\b/i.test(line),
+          );
+          if (importantLines.length > 0) {
+            parts.push(...importantLines.slice(0, 5));
+          }
+        }
+      }
+    }
+  }
+
+  return parts.length > 0
+    ? parts.join("\n")
+    : "Previous conversation contained general discussion with no notable trading activity.";
+}
+
+const COMPACTION_INSTRUCTIONS = `You are summarizing a stock trading agent's conversation history.
+
+MUST PRESERVE:
+- All trades executed (symbol, quantity, price, type, P&L)
+- Active positions and their current status
+- Open orders and pending alerts
+- Risk assessments and their outcomes
+- Key market observations and analysis results
+- Decisions made and their rationale
+- Any commitments or follow-ups promised to the user
+
+PRIORITIZE recent context over older history. The agent needs to know
+what it was doing and what positions it holds, not just what was discussed.
+
+Preserve all ticker symbols, prices, quantities, and dates exactly.`;
 
 /**
  * Run a single agent turn with full event handling and persistence.

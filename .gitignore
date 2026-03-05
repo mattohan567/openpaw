@@ -7,3 +7,6 @@ clone-references/
 __pycache__/
 *.pyc
 .venv/
+.openpaw/
+credentials/
+.env.*

@@ -9,12 +9,28 @@
  * replayed back into the Agent on restart.
  */
 
-import { appendFileSync, readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  readFileSync,
+  existsSync,
+  mkdirSync,
+  writeFileSync,
+  readdirSync,
+  renameSync,
+  unlinkSync,
+  statSync,
+} from "node:fs";
 import { join } from "node:path";
 import { STATE_DIR } from "./config.js";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import { createSubsystemLogger } from "./logger.js";
 
+const log = createSubsystemLogger("Session");
 const SESSIONS_DIR = join(STATE_DIR, "sessions");
+const ARCHIVE_DIR = join(SESSIONS_DIR, "archive");
+// Archive sessions older than 7 days, delete archives older than 30 days
+const ARCHIVE_AGE_DAYS = 7;
+const DELETE_AGE_DAYS = 30;
 
 export interface TranscriptEntry {
   id: string;
@@ -118,4 +134,57 @@ export function openSession(sessionId: string): SessionStore {
       turnCount = summaryMessages.length;
     },
   };
+}
+
+/**
+ * Archive old session files and prune ancient archives.
+ * Like OpenClaw's session archiving - moves stale sessions to an archive
+ * folder and deletes sessions older than DELETE_AGE_DAYS.
+ * Called on gateway startup.
+ */
+export function archiveOldSessions(): void {
+  if (!existsSync(SESSIONS_DIR)) return;
+
+  if (!existsSync(ARCHIVE_DIR)) {
+    mkdirSync(ARCHIVE_DIR, { recursive: true });
+  }
+
+  const now = Date.now();
+  const archiveCutoff = now - ARCHIVE_AGE_DAYS * 24 * 60 * 60 * 1000;
+  const deleteCutoff = now - DELETE_AGE_DAYS * 24 * 60 * 60 * 1000;
+
+  // Archive old active sessions
+  const sessionFiles = readdirSync(SESSIONS_DIR).filter((f) => f.endsWith(".jsonl"));
+  for (const file of sessionFiles) {
+    // Don't archive the active "main" session
+    if (file === "main.jsonl") continue;
+
+    const filePath = join(SESSIONS_DIR, file);
+    try {
+      const stat = statSync(filePath);
+      if (stat.mtimeMs < archiveCutoff) {
+        renameSync(filePath, join(ARCHIVE_DIR, file));
+        log.info(`Archived session: ${file}`);
+      }
+    } catch {
+      // Skip files we can't stat
+    }
+  }
+
+  // Delete ancient archives
+  if (existsSync(ARCHIVE_DIR)) {
+    const archiveFiles = readdirSync(ARCHIVE_DIR).filter((f) => f.endsWith(".jsonl"));
+    for (const file of archiveFiles) {
+      const filePath = join(ARCHIVE_DIR, file);
+      try {
+        const stat = statSync(filePath);
+        if (stat.mtimeMs < deleteCutoff) {
+          unlinkSync(filePath);
+          log.info(`Pruned archived session: ${file}`);
+        }
+      } catch {
+        // Skip files we can't stat/delete
+      }
+    }
+  }
 }

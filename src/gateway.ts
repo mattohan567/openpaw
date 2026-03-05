@@ -18,10 +18,14 @@ import { connectWhatsApp, type WhatsAppClient } from "./whatsapp.js";
 import { createOpenPawTools } from "./tools/index.js";
 import { createAgent, restoreSession, runAgentTurn, type AgentRunResult } from "./agent.js";
 import type { Agent } from "@mariozechner/pi-agent-core";
-import { openSession, type SessionStore } from "./session.js";
+import { openSession, archiveOldSessions, type SessionStore } from "./session.js";
 import { startHeartbeat, startMarketOpenJob, startMarketCloseJob } from "./cron.js";
 import { AlpacaStream } from "./streaming.js";
 import { startSidecars, stopSidecars } from "./sidecars.js";
+import { createSubsystemLogger, pruneOldLogs } from "./logger.js";
+import { pruneOldDailyLogs } from "./memory.js";
+
+const log = createSubsystemLogger("Gateway");
 
 export interface GatewayServer {
   httpServer: Server;
@@ -63,9 +67,14 @@ function createTurnQueue(
 export async function startGateway(): Promise<GatewayServer> {
   const config = loadConfig();
 
-  console.log("[Gateway] Starting OpenPaw...");
-  console.log(`[Gateway] Port: ${config.gateway.port}`);
-  console.log(`[Gateway] Paper trading: ${config.trading.paperTrading}`);
+  log.info("Starting OpenPaw...");
+  log.info(`Port: ${config.gateway.port}`);
+  log.info(`Paper trading: ${config.trading.paperTrading}`);
+
+  // Prune old logs, sessions, and daily memory on startup
+  pruneOldLogs();
+  archiveOldSessions();
+  pruneOldDailyLogs();
 
   // Start Python sidecars (quant-analysis, backtesting)
   await startSidecars();
@@ -79,37 +88,37 @@ export async function startGateway(): Promise<GatewayServer> {
     );
 
     stream.on("error", (err) => {
-      console.error("[Stream] Error:", err.message);
+      log.error("Stream error:", err.message);
     });
 
     stream.on("connected", () => {
-      console.log("[Stream] Connected to Alpaca real-time data.");
+      log.info("Connected to Alpaca real-time data.");
       if (config.streaming.streamWatchlist && config.trading.watchlist.length > 0) {
         stream!.subscribe(config.trading.watchlist);
-        console.log(`[Stream] Streaming watchlist: ${config.trading.watchlist.join(", ")}`);
+        log.info(`Streaming watchlist: ${config.trading.watchlist.join(", ")}`);
       }
     });
 
     stream.connect();
   } else {
-    console.log("[Gateway] Real-time streaming disabled or no API key.");
+    log.info("Real-time streaming disabled or no API key.");
   }
 
   // Create tools (pass stream for alert tools)
   const tools = createOpenPawTools(config, stream);
-  console.log(`[Gateway] ${tools.length} tools registered.`);
+  log.info(`${tools.length} tools registered.`);
 
   // Open persistent session (JSONL transcript)
   const session = openSession("main");
 
   // Create Pi SDK agent (same engine as OpenClaw), pass session for disk compaction
   const agent = createAgent(tools, config, session);
-  console.log(`[Gateway] Session opened (${session.turnCount} entries in transcript).`);
+  log.info(`Session opened (${session.turnCount} entries in transcript).`);
 
   // Restore agent context from transcript (survives restarts)
   const restored = restoreSession(agent, session);
   if (restored > 0) {
-    console.log(`[Gateway] Agent context restored with ${restored} messages.`);
+    log.info(`Agent context restored with ${restored} messages.`);
   }
 
   // Serialized agent turn queue — prevents concurrent access
@@ -119,12 +128,12 @@ export async function startGateway(): Promise<GatewayServer> {
   let whatsapp: WhatsAppClient | null = null;
 
   if (config.whatsapp.ownerNumber) {
-    console.log("[Gateway] Connecting WhatsApp...");
+    log.info("Connecting WhatsApp...");
     try {
       whatsapp = await connectWhatsApp(config);
 
       whatsapp.onMessage(async (text: string) => {
-        console.log(`\n[WhatsApp] >>> Owner: ${text}`);
+        log.info(`WhatsApp >>> Owner: ${text}`);
 
         try {
           const result = await enqueueTurn(text, {
@@ -132,17 +141,17 @@ export async function startGateway(): Promise<GatewayServer> {
               process.stdout.write(delta);
             },
             onToolUse: (toolName) => {
-              console.log(`\n[Agent] Using tool: ${toolName}`);
+              log.info(`Using tool: ${toolName}`);
             },
           });
 
-          console.log(`\n[Agent] Done. Tools used: ${result.toolsUsed.length ? result.toolsUsed.join(", ") : "none"}`);
+          log.info(`Done. Tools used: ${result.toolsUsed.length ? result.toolsUsed.join(", ") : "none"}`);
 
           if (result.response.trim()) {
             await whatsapp!.sendMessage(result.response);
           }
         } catch (err) {
-          console.error("[Agent] Error:", err);
+          log.error("Agent error:", err);
           try {
             await whatsapp!.sendMessage(
               `Error processing your request: ${err instanceof Error ? err.message : "Unknown error"}`,
@@ -151,13 +160,13 @@ export async function startGateway(): Promise<GatewayServer> {
         }
       });
 
-      console.log("[Gateway] WhatsApp connected and listening.");
+      log.info("WhatsApp connected and listening.");
     } catch (err) {
-      console.error("[Gateway] WhatsApp connection failed:", err);
-      console.log("[Gateway] Continuing without WhatsApp. Run 'openpaw setup' to configure.");
+      log.error("WhatsApp connection failed:", err);
+      log.info("Continuing without WhatsApp. Run 'openpaw setup' to configure.");
     }
   } else {
-    console.log("[Gateway] WhatsApp not configured. Run 'openpaw setup' to configure.");
+    log.info("WhatsApp not configured. Run 'openpaw setup' to configure.");
   }
 
   // Notification helper
@@ -166,10 +175,10 @@ export async function startGateway(): Promise<GatewayServer> {
       try {
         await whatsapp.sendMessage(text);
       } catch (err) {
-        console.error("[WhatsApp] Send failed:", err);
+        log.error("WhatsApp send failed:", err);
       }
     } else {
-      console.log(`[Notification] ${text}`);
+      log.info(`Notification: ${text}`);
     }
   };
 
@@ -180,7 +189,7 @@ export async function startGateway(): Promise<GatewayServer> {
       const currentPrice = event.data.currentPrice as number;
       const msg = `*Alert* ${alert.symbol} ${alert.condition} $${alert.price.toFixed(2)} — now $${currentPrice.toFixed(2)}${alert.message ? `\n${alert.message}` : ""}`;
 
-      console.log(`[Alert] ${msg}`);
+      log.info(`Alert: ${msg}`);
       await sendWhatsApp(msg);
 
       try {
@@ -191,7 +200,7 @@ export async function startGateway(): Promise<GatewayServer> {
           await sendWhatsApp(result.response);
         }
       } catch (err) {
-        console.error("[Alert] Agent error:", err);
+        log.error("Alert agent error:", err);
       }
     });
   }
@@ -300,13 +309,13 @@ export async function startGateway(): Promise<GatewayServer> {
   await new Promise<void>((resolve, reject) => {
     httpServer.once("error", reject);
     httpServer.listen(config.gateway.port, config.gateway.host, () => {
-      console.log(`[Gateway] Listening on ${config.gateway.host}:${config.gateway.port}`);
+      log.info(`Listening on ${config.gateway.host}:${config.gateway.port}`);
       resolve();
     });
   });
 
   const close = async () => {
-    console.log("[Gateway] Shutting down gracefully...");
+    log.info("Shutting down gracefully...");
     try {
       await agent.waitForIdle();
     } catch {}
@@ -318,7 +327,7 @@ export async function startGateway(): Promise<GatewayServer> {
     wss.close();
     httpServer.close();
     if (whatsapp) await whatsapp.close();
-    console.log("[Gateway] Shut down.");
+    log.info("Shut down.");
   };
 
   return {

@@ -9,10 +9,15 @@
  * Before compaction, the agent is prompted to flush important info to memory.
  */
 
-import { readFileSync, writeFileSync, appendFileSync, existsSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, existsSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { MEMORY_DIR } from "./config.js";
 import type { Tool } from "./tools/types.js";
+import { createSubsystemLogger } from "./logger.js";
+
+const log = createSubsystemLogger("Memory");
+// Keep daily logs for 90 days, then prune
+const DAILY_LOG_RETENTION_DAYS = 90;
 
 function todayFile(): string {
   return join(MEMORY_DIR, `${new Date().toISOString().split("T")[0]}.md`);
@@ -185,4 +190,33 @@ export function loadTodayLog(): string {
   const path = todayFile();
   if (!existsSync(path)) return "";
   return readFileSync(path, "utf-8");
+}
+
+/**
+ * Prune daily log files older than DAILY_LOG_RETENTION_DAYS.
+ * Keeps MEMORY.md (curated) forever — only prunes dated daily logs.
+ * Called on gateway startup.
+ */
+export function pruneOldDailyLogs(): void {
+  if (!existsSync(MEMORY_DIR)) return;
+
+  const cutoff = Date.now() - DAILY_LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const files = readdirSync(MEMORY_DIR).filter((f) =>
+    /^\d{4}-\d{2}-\d{2}\.md$/.test(f),
+  );
+
+  for (const file of files) {
+    const dateStr = file.replace(".md", "");
+    const fileDate = new Date(dateStr).getTime();
+    if (isNaN(fileDate)) continue;
+
+    if (fileDate < cutoff) {
+      try {
+        unlinkSync(join(MEMORY_DIR, file));
+        log.info(`Pruned old daily log: ${file}`);
+      } catch {
+        // Ignore deletion errors
+      }
+    }
+  }
 }
