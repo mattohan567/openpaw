@@ -1,0 +1,40 @@
+{
+  "name": "openpaw",
+  "version": "0.1.0",
+  "description": "Autonomous stock trading agent with WhatsApp notifications",
+  "type": "module",
+  "main": "dist/entry.js",
+  "bin": {
+    "openpaw": "./openpaw.mjs"
+  },
+  "scripts": {
+    "build": "npx tsdown",
+    "dev": "tsx src/entry.ts",
+    "gateway": "tsx src/entry.ts gateway run",
+    "gateway:watch": "tsx watch src/entry.ts gateway run"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@hapi/boom": "^10.0.1",
+    "@mariozechner/pi-agent-core": "0.55.3",
+    "@mariozechner/pi-ai": "0.55.3",
+    "@mariozechner/pi-coding-agent": "0.55.3",
+    "@whiskeysockets/baileys": "^6.7.16",
+    "commander": "^13.1.0",
+    "cron": "^3.3.1",
+    "json5": "^2.2.3",
+    "pino": "^9.6.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/hapi__boom": "^9.0.1",
+    "@types/node": "^22.13.0",
+    "@types/ws": "^8.5.14",
+    "tsdown": "^0.9.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
