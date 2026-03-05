@@ -32,14 +32,26 @@ export interface CronConfig {
   marketCloseReport: boolean;
 }
 
+export interface RiskSettings {
+  maxDailyLoss: number;       // max $ loss per day before halting trades
+  maxDailyLossPct: number;    // max % loss per day
+  maxOpenPositions: number;   // max concurrent positions
+  positionAgingDays: number;  // flag positions held longer than this
+}
+
 export interface OpenPawConfig {
   trading: TradingConfig;
   whatsapp: WhatsAppConfig;
   agent: AgentConfig;
   cron: CronConfig;
+  risk: RiskSettings;
   gateway: {
     port: number;
     host: string;
+  };
+  streaming: {
+    enabled: boolean;
+    streamWatchlist: boolean; // auto-stream watchlist symbols
   };
   tradeLogFile: string;
 }
@@ -77,9 +89,19 @@ const DEFAULT_CONFIG: OpenPawConfig = {
     marketOpenHeartbeat: true,
     marketCloseReport: true,
   },
+  risk: {
+    maxDailyLoss: 500,
+    maxDailyLossPct: 0.05,
+    maxOpenPositions: 10,
+    positionAgingDays: 5,
+  },
   gateway: {
     port: 18790,
     host: "127.0.0.1",
+  },
+  streaming: {
+    enabled: true,
+    streamWatchlist: true,
   },
   tradeLogFile: TRADE_LOG_PATH,
 };
@@ -102,7 +124,13 @@ export function loadConfig(): OpenPawConfig {
 
   const raw = readFileSync(CONFIG_PATH, "utf-8");
   const parsed = JSON5.parse(raw);
-  return { ...DEFAULT_CONFIG, ...parsed, trading: { ...DEFAULT_CONFIG.trading, ...parsed.trading } };
+  return {
+    ...DEFAULT_CONFIG,
+    ...parsed,
+    trading: { ...DEFAULT_CONFIG.trading, ...parsed.trading },
+    risk: { ...DEFAULT_CONFIG.risk, ...parsed.risk },
+    streaming: { ...DEFAULT_CONFIG.streaming, ...parsed.streaming },
+  };
 }
 
 export function saveConfig(config: OpenPawConfig): void {

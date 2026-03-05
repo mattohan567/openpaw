@@ -7,6 +7,7 @@
  * - Routes messages to the Pi SDK agent
  * - Streams responses back as they generate
  * - Runs heartbeat/cron for scheduled checks
+ * - Streams real-time market data via Alpaca WebSocket
  * - Exposes HTTP health check and WebSocket for CLI
  */
 
@@ -19,13 +20,14 @@ import { createAgent, restoreSession, runAgentTurn } from "./agent.js";
 import type { Agent } from "@mariozechner/pi-agent-core";
 import { openSession } from "./session.js";
 import { startHeartbeat, startMarketOpenJob, startMarketCloseJob } from "./cron.js";
-import { readFileSync, existsSync } from "node:fs";
+import { AlpacaStream } from "./streaming.js";
 import type { Tool } from "./tools/types.js";
 
 export interface GatewayServer {
   httpServer: Server;
   wss: WebSocketServer;
   whatsapp: WhatsAppClient | null;
+  stream: AlpacaStream | null;
   config: OpenPawConfig;
   close: () => Promise<void>;
 }
@@ -37,8 +39,34 @@ export async function startGateway(): Promise<GatewayServer> {
   console.log(`[Gateway] Port: ${config.gateway.port}`);
   console.log(`[Gateway] Paper trading: ${config.trading.paperTrading}`);
 
-  // Create tools
-  const tools = createOpenPawTools(config);
+  // Start real-time market data stream
+  let stream: AlpacaStream | null = null;
+  if (config.streaming.enabled && config.trading.alpacaApiKey) {
+    stream = new AlpacaStream(
+      config.trading.alpacaApiKey,
+      config.trading.alpacaSecretKey,
+    );
+
+    stream.on("error", (err) => {
+      console.error("[Stream] Error:", err.message);
+    });
+
+    stream.on("connected", () => {
+      console.log("[Stream] Connected to Alpaca real-time data.");
+      // Auto-subscribe to watchlist if configured
+      if (config.streaming.streamWatchlist && config.trading.watchlist.length > 0) {
+        stream!.subscribe(config.trading.watchlist);
+        console.log(`[Stream] Streaming watchlist: ${config.trading.watchlist.join(", ")}`);
+      }
+    });
+
+    stream.connect();
+  } else {
+    console.log("[Gateway] Real-time streaming disabled or no API key.");
+  }
+
+  // Create tools (pass stream for alert tools)
+  const tools = createOpenPawTools(config, stream);
   console.log(`[Gateway] ${tools.length} tools registered.`);
 
   // Create Pi SDK agent (same engine as OpenClaw)
@@ -109,6 +137,35 @@ export async function startGateway(): Promise<GatewayServer> {
     }
   };
 
+  // Wire up real-time alerts → WhatsApp notifications
+  if (stream) {
+    stream.on("alert_triggered", async (event) => {
+      const alert = event.alert!;
+      const currentPrice = event.data.currentPrice as number;
+      const msg = `*Alert* ${alert.symbol} ${alert.condition} $${alert.price.toFixed(2)} — now $${currentPrice.toFixed(2)}${alert.message ? `\n${alert.message}` : ""}`;
+
+      console.log(`[Alert] ${msg}`);
+
+      // Notify via WhatsApp
+      await sendWhatsApp(msg);
+
+      // Also tell the agent so it can decide what to do
+      try {
+        const result = await runAgentTurn(
+          agent,
+          session,
+          `PRICE ALERT TRIGGERED: ${alert.symbol} ${alert.condition} $${alert.price.toFixed(2)}. Current price: $${currentPrice.toFixed(2)}.${alert.message ? ` Context: ${alert.message}` : ""} — Should you act on this?`,
+          config,
+        );
+        if (result.response.trim()) {
+          await sendWhatsApp(result.response);
+        }
+      } catch (err) {
+        console.error("[Alert] Agent error:", err);
+      }
+    });
+  }
+
   // Start cron jobs
   const cronCtx = { config, tools, sendWhatsApp, agent, session };
   const heartbeatJob = startHeartbeat(cronCtx);
@@ -123,9 +180,11 @@ export async function startGateway(): Promise<GatewayServer> {
         JSON.stringify({
           status: "ok",
           whatsapp: !!whatsapp,
+          streaming: !!stream,
           tools: tools.map((t) => t.name),
           paperTrading: config.trading.paperTrading,
           sessionTurns: session.turnCount,
+          alerts: stream?.getAlerts().length ?? 0,
           uptime: process.uptime(),
         }),
       );
@@ -179,8 +238,10 @@ export async function startGateway(): Promise<GatewayServer> {
             JSON.stringify({
               type: "status",
               whatsapp: !!whatsapp,
+              streaming: !!stream,
               tools: tools.length,
               sessionTurns: session.turnCount,
+              alerts: stream?.getAlerts().length ?? 0,
               uptime: process.uptime(),
             }),
           );
@@ -196,16 +257,16 @@ export async function startGateway(): Promise<GatewayServer> {
     });
   });
 
-  // Signal handling (like OpenClaw's run-loop.ts)
+  // Signal handling
   const shutdown = async () => {
     console.log("\n[Gateway] Shutting down gracefully...");
-    // Wait for agent to finish current turn
     try {
       await agent.waitForIdle();
     } catch {}
     heartbeatJob.stop();
     marketOpenJob?.stop();
     marketCloseJob?.stop();
+    if (stream) stream.close();
     wss.close();
     httpServer.close();
     if (whatsapp) await whatsapp.close();
@@ -228,11 +289,13 @@ export async function startGateway(): Promise<GatewayServer> {
     httpServer,
     wss,
     whatsapp,
+    stream,
     config,
     close: async () => {
       heartbeatJob.stop();
       marketOpenJob?.stop();
       marketCloseJob?.stop();
+      if (stream) stream.close();
       wss.close();
       httpServer.close();
       if (whatsapp) await whatsapp.close();
