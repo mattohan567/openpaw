@@ -89,8 +89,24 @@ export function buildProgram(): Command {
       console.log("\n=== OpenPaw Setup ===\n");
       console.log(`Config: ${CONFIG_PATH}\n`);
 
+      // LLM Provider
+      console.log("--- LLM Provider ---");
+      console.log("Supported: xai (Grok), anthropic (Claude), openai (GPT), google (Gemini)");
+      const provider = await ask(`Provider [${config.agent.provider}]: `);
+      if (provider) config.agent.provider = provider;
+
+      const modelHelp: Record<string, string> = {
+        xai: "grok-3-fast, grok-4, grok-4-fast",
+        anthropic: "claude-sonnet-4-20250514, claude-opus-4-20250514",
+        openai: "gpt-5-mini, gpt-5.2",
+        google: "gemini-2.5-pro",
+      };
+      const hint = modelHelp[config.agent.provider] || "";
+      const model = await ask(`Model${hint ? ` (e.g. ${hint})` : ""} [${config.agent.model}]: `);
+      if (model) config.agent.model = model;
+
       // Alpaca
-      console.log("--- Alpaca Trading API ---");
+      console.log("\n--- Alpaca Trading API ---");
       const apiKey = await ask(`Alpaca API Key [${config.trading.alpacaApiKey ? "***set***" : "not set"}]: `);
       if (apiKey) config.trading.alpacaApiKey = apiKey;
 

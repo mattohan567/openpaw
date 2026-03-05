@@ -20,6 +20,7 @@ export interface WhatsAppConfig {
 }
 
 export interface AgentConfig {
+  provider: string; // "anthropic", "xai", "openai", "google", "openrouter", etc.
   model: string;
   maxTokens: number;
   systemPromptFile: string; // path to SOUL.md or similar
@@ -67,7 +68,8 @@ const DEFAULT_CONFIG: OpenPawConfig = {
     authDir: CREDENTIALS_DIR,
   },
   agent: {
-    model: "claude-sonnet-4-20250514",
+    provider: "xai",
+    model: "grok-3-fast",
     maxTokens: 4096,
     systemPromptFile: join(STATE_DIR, "SOUL.md"),
   },

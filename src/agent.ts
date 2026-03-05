@@ -90,22 +90,32 @@ function toPiTool(tool: Tool): AgentTool<any> {
 }
 
 /**
- * Resolve the Claude model definition for Pi SDK.
+ * Resolve model definition for Pi SDK.
+ * Supports any provider the Pi SDK supports: anthropic, xai, openai, google, etc.
  */
-function resolveModel(config: OpenPawConfig): Model<"anthropic-messages"> {
+function resolveModel(config: OpenPawConfig): Model<any> {
+  const provider = config.agent.provider || "xai";
   try {
-    return getModel("anthropic", config.agent.model as any);
+    return getModel(provider as any, config.agent.model as any);
   } catch {
+    // Fallback: manually define for unknown models
+    const apiMap: Record<string, string> = {
+      anthropic: "anthropic-messages",
+      xai: "openai-completions",
+      openai: "openai-completions",
+      google: "google-generative-ai",
+      openrouter: "openai-completions",
+    };
     return {
       id: config.agent.model,
       name: config.agent.model,
-      api: "anthropic-messages",
-      provider: "anthropic",
-      baseUrl: "https://api.anthropic.com",
-      reasoning: true,
-      input: ["text", "image"],
-      cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
-      contextWindow: 200000,
+      api: apiMap[provider] || "openai-completions",
+      provider,
+      baseUrl: "",
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 131072,
       maxTokens: config.agent.maxTokens,
     };
   }
