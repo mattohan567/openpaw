@@ -135,6 +135,79 @@ export function createQuantTools(): Tool[] {
       },
     },
     {
+      name: "get_vwap",
+      description:
+        "Get real-time VWAP (Volume-Weighted Average Price) with bands for a stock. VWAP is the #1 day trading indicator — price above VWAP = bullish bias, below = bearish. Also returns upper/lower bands (1 and 2 std devs) as support/resistance levels.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          symbol: { type: "string", description: "Stock ticker symbol" },
+        },
+        required: ["symbol"],
+      },
+      execute: async (params) => {
+        const symbol = (params.symbol as string).toUpperCase();
+        try {
+          return await quantRequest(`/vwap/${symbol}`);
+        } catch (err) {
+          return `VWAP failed (is the quant service running?): ${err instanceof Error ? err.message : "unknown"}`;
+        }
+      },
+    },
+    {
+      name: "scan_gaps",
+      description:
+        "Scan for stocks gapping up or down from previous close. Gap-and-go is one of the highest-probability day trading setups. Filters by minimum gap %, minimum volume, and max price. Returns sorted by gap size.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          min_gap_pct: { type: "number", description: "Minimum gap % from prev close (default: 4)" },
+          min_volume: { type: "number", description: "Minimum volume (default: 100000)" },
+          max_price: { type: "number", description: "Max stock price to include (default: 50)" },
+        },
+      },
+      execute: async (params) => {
+        const qp = new URLSearchParams();
+        if (params.min_gap_pct) qp.set("min_gap_pct", String(params.min_gap_pct));
+        if (params.min_volume) qp.set("min_volume", String(params.min_volume));
+        if (params.max_price) qp.set("max_price", String(params.max_price));
+        const qs = qp.toString() ? `?${qp.toString()}` : "";
+        try {
+          return await quantRequest(`/gaps${qs}`);
+        } catch (err) {
+          return `Gap scan failed (is the quant service running?): ${err instanceof Error ? err.message : "unknown"}`;
+        }
+      },
+    },
+    {
+      name: "calc_position_size",
+      description:
+        "Calculate ATR-based position size for a stock. Uses volatility (ATR) to determine stop-loss distance, then sizes the position so you risk a fixed % of equity. Returns recommended shares, stop price, and take-profit levels at 1:1, 1.5:1, and 2:1 risk/reward.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          symbol: { type: "string", description: "Stock ticker symbol" },
+          account_equity: { type: "number", description: "Your account equity in dollars" },
+          risk_pct: { type: "number", description: "Risk per trade as % of equity (default: 1.0)" },
+          atr_multiplier: { type: "number", description: "ATR multiplier for stop distance (default: 2.0)" },
+        },
+        required: ["symbol", "account_equity"],
+      },
+      execute: async (params) => {
+        const symbol = (params.symbol as string).toUpperCase();
+        const equity = Number(params.account_equity);
+        const risk = params.risk_pct ? Number(params.risk_pct) : 1.0;
+        const atrMult = params.atr_multiplier ? Number(params.atr_multiplier) : 2.0;
+        try {
+          return await quantRequest(
+            `/position_size/${symbol}?account_equity=${equity}&risk_pct=${risk}&atr_multiplier=${atrMult}`,
+          );
+        } catch (err) {
+          return `Position sizing failed (is the quant service running?): ${err instanceof Error ? err.message : "unknown"}`;
+        }
+      },
+    },
+    {
       name: "optimize_strategy",
       description:
         "Find the best parameters for a strategy by testing many combinations. Returns top 3 parameter sets ranked by Sharpe ratio (or other metric). Use this to tune a strategy before trading it.",

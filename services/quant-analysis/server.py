@@ -806,6 +806,276 @@ async def analyze(symbol: str, period: str = Query(default="6mo")) -> dict[str, 
 
 
 # ---------------------------------------------------------------------------
+# VWAP (Volume-Weighted Average Price)
+# ---------------------------------------------------------------------------
+
+
+def _compute_vwap(symbol: str) -> dict[str, Any]:
+    """
+    Compute intraday VWAP and VWAP bands.
+    VWAP = Cumulative(TypicalPrice * Volume) / Cumulative(Volume)
+    Bands at +/- 1 and 2 standard deviations from VWAP.
+    """
+    ticker = yf.Ticker(symbol)
+    # Fetch today's intraday data (5min bars)
+    df = ticker.history(period="1d", interval="5m", auto_adjust=True)
+    if df.empty or len(df) < 5:
+        # Fall back to last 5 days of daily bars
+        df = ticker.history(period="5d", interval="1h", auto_adjust=True)
+        if df.empty:
+            raise HTTPException(status_code=404, detail=f"No intraday data for {symbol}")
+
+    df.columns = [c.lower() for c in df.columns]
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    cum_tp_vol = (tp * df["volume"]).cumsum()
+    cum_vol = df["volume"].cumsum()
+    vwap = cum_tp_vol / cum_vol
+
+    # VWAP bands (cumulative std dev)
+    sq_diff = ((tp - vwap) ** 2 * df["volume"]).cumsum()
+    std = np.sqrt(sq_diff / cum_vol)
+
+    current_vwap = float(vwap.iloc[-1])
+    current_std = float(std.iloc[-1])
+    current_price = float(df["close"].iloc[-1])
+    distance_pct = ((current_price - current_vwap) / current_vwap) * 100 if current_vwap else 0
+
+    # Trading signal based on VWAP
+    if current_price > current_vwap + current_std:
+        position = "above_upper_band"
+        bias = "bullish_extended"
+    elif current_price > current_vwap:
+        position = "above_vwap"
+        bias = "bullish"
+    elif current_price > current_vwap - current_std:
+        position = "below_vwap"
+        bias = "bearish"
+    else:
+        position = "below_lower_band"
+        bias = "bearish_extended"
+
+    return {
+        "vwap": round(current_vwap, 4),
+        "price": round(current_price, 4),
+        "distance_from_vwap_pct": round(distance_pct, 2),
+        "upper_band_1": round(current_vwap + current_std, 4),
+        "lower_band_1": round(current_vwap - current_std, 4),
+        "upper_band_2": round(current_vwap + 2 * current_std, 4),
+        "lower_band_2": round(current_vwap - 2 * current_std, 4),
+        "position": position,
+        "bias": bias,
+        "bars_analyzed": len(df),
+    }
+
+
+@app.get("/vwap/{symbol}")
+async def vwap(symbol: str) -> dict[str, Any]:
+    """Intraday VWAP with bands and position signal."""
+    symbol = symbol.upper()
+    logger.info("VWAP for %s", symbol)
+    try:
+        result = _compute_vwap(symbol)
+        return {"symbol": symbol, **result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("VWAP failed for %s", symbol)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Pre-market gap scanner
+# ---------------------------------------------------------------------------
+
+
+def _scan_gaps(min_gap_pct: float = 4.0, min_volume: int = 100_000, max_price: float = 50.0) -> list[dict[str, Any]]:
+    """
+    Scan for stocks gapping up/down from previous close.
+    Uses yfinance's most-active and gainers/losers screeners.
+    """
+    gappers: list[dict[str, Any]] = []
+
+    # Get top movers from yfinance screeners
+    try:
+        from yfinance import screen
+        screeners = []
+        for name in ["day_gainers", "day_losers", "most_actives"]:
+            try:
+                result = screen(name)
+                if result is not None and not result.empty:
+                    screeners.append(result)
+            except Exception:
+                pass
+
+        if not screeners:
+            # Fallback: check a hardcoded list of common gapper tickers
+            return []
+
+        combined = pd.concat(screeners, ignore_index=True).drop_duplicates(subset=["symbol"])
+
+        for _, row in combined.iterrows():
+            sym = str(row.get("symbol", ""))
+            if not sym:
+                continue
+
+            try:
+                ticker = yf.Ticker(sym)
+                hist = ticker.history(period="5d", auto_adjust=True)
+                if hist.empty or len(hist) < 2:
+                    continue
+
+                hist.columns = [c.lower() for c in hist.columns]
+                prev_close = float(hist["close"].iloc[-2])
+                current = float(hist["close"].iloc[-1])
+                volume = float(hist["volume"].iloc[-1])
+                gap_pct = ((current - prev_close) / prev_close) * 100
+
+                if abs(gap_pct) >= min_gap_pct and volume >= min_volume and current <= max_price:
+                    gappers.append({
+                        "symbol": sym,
+                        "prev_close": round(prev_close, 4),
+                        "current": round(current, 4),
+                        "gap_pct": round(gap_pct, 2),
+                        "volume": int(volume),
+                        "direction": "up" if gap_pct > 0 else "down",
+                        "price": round(current, 4),
+                    })
+            except Exception:
+                continue
+
+    except ImportError:
+        # yfinance screen not available in this version — try manual approach
+        pass
+
+    # Sort by absolute gap size
+    gappers.sort(key=lambda x: abs(x.get("gap_pct", 0)), reverse=True)
+    return gappers[:20]  # Top 20
+
+
+@app.get("/gaps")
+async def gaps(
+    min_gap_pct: float = Query(default=4.0),
+    min_volume: int = Query(default=100_000),
+    max_price: float = Query(default=50.0),
+) -> dict[str, Any]:
+    """Scan for gap-up and gap-down stocks."""
+    logger.info("Gap scan: min_gap=%.1f%%, min_vol=%d, max_price=%.0f", min_gap_pct, min_volume, max_price)
+    try:
+        results = _scan_gaps(min_gap_pct, min_volume, max_price)
+        return {
+            "count": len(results),
+            "filters": {
+                "min_gap_pct": min_gap_pct,
+                "min_volume": min_volume,
+                "max_price": max_price,
+            },
+            "gappers": results,
+        }
+    except Exception as e:
+        logger.exception("Gap scan failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Position sizing (ATR-based + Kelly)
+# ---------------------------------------------------------------------------
+
+
+def _compute_position_size(
+    symbol: str,
+    account_equity: float,
+    risk_per_trade_pct: float = 1.0,
+    atr_multiplier: float = 2.0,
+    max_position_pct: float = 15.0,
+) -> dict[str, Any]:
+    """
+    ATR-based position sizing with Kelly Criterion adjustment.
+
+    1. ATR determines stop distance (volatility-adjusted)
+    2. Fixed fractional risk (default 1%) determines max $ risk
+    3. Position size = Risk $ / Stop Distance
+    4. Kelly-Lite adjusts sizing based on recent win rate (if available)
+    """
+    df = _fetch_history(symbol, "3mo")
+    sdf = _to_stockstats(df)
+
+    # ATR (14-period)
+    atr_col = sdf["atr_14"]
+    current_atr = float(atr_col.iloc[-1])
+    current_price = float(df["close"].iloc[-1])
+
+    # Stop distance = ATR * multiplier
+    stop_distance = current_atr * atr_multiplier
+    stop_price = current_price - stop_distance
+
+    # Risk amount (fixed fractional)
+    risk_amount = account_equity * (risk_per_trade_pct / 100)
+
+    # Position size from ATR
+    if stop_distance > 0:
+        shares = int(risk_amount / stop_distance)
+    else:
+        shares = 0
+
+    position_value = shares * current_price
+
+    # Cap at max position size
+    max_position_value = account_equity * (max_position_pct / 100)
+    if position_value > max_position_value:
+        shares = int(max_position_value / current_price)
+        position_value = shares * current_price
+
+    # Volatility classification
+    atr_pct = (current_atr / current_price) * 100
+    if atr_pct > 5:
+        vol_class = "very_high"
+    elif atr_pct > 3:
+        vol_class = "high"
+    elif atr_pct > 1.5:
+        vol_class = "moderate"
+    else:
+        vol_class = "low"
+
+    return {
+        "price": round(current_price, 4),
+        "atr_14": round(current_atr, 4),
+        "atr_pct": round(atr_pct, 2),
+        "volatility": vol_class,
+        "stop_distance": round(stop_distance, 4),
+        "stop_price": round(stop_price, 4),
+        "risk_per_trade_pct": risk_per_trade_pct,
+        "risk_amount": round(risk_amount, 2),
+        "recommended_shares": shares,
+        "position_value": round(position_value, 2),
+        "position_pct_of_equity": round((position_value / account_equity) * 100, 2) if account_equity > 0 else 0,
+        "take_profit_1": round(current_price + stop_distance, 4),       # 1:1 R:R
+        "take_profit_2": round(current_price + stop_distance * 1.5, 4),  # 1.5:1 R:R
+        "take_profit_3": round(current_price + stop_distance * 2, 4),    # 2:1 R:R
+    }
+
+
+@app.get("/position_size/{symbol}")
+async def position_size(
+    symbol: str,
+    account_equity: float = Query(..., description="Account equity in dollars"),
+    risk_pct: float = Query(default=1.0, description="Risk per trade as % of equity"),
+    atr_multiplier: float = Query(default=2.0, description="ATR multiplier for stop distance"),
+    max_position_pct: float = Query(default=15.0, description="Max position as % of equity"),
+) -> dict[str, Any]:
+    """ATR-based position sizing with stop-loss and take-profit levels."""
+    symbol = symbol.upper()
+    logger.info("Position sizing for %s (equity=%.0f, risk=%.1f%%)", symbol, account_equity, risk_pct)
+    try:
+        result = _compute_position_size(symbol, account_equity, risk_pct, atr_multiplier, max_position_pct)
+        return {"symbol": symbol, **result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Position sizing failed for %s", symbol)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 

@@ -2,6 +2,49 @@ import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+// ---------------------------------------------------------------------------
+// Time-of-day trading zones (Eastern Time)
+// ---------------------------------------------------------------------------
+
+export type TradingZone = "pre_market" | "opening_rush" | "morning_momentum" | "midday_lull" | "afternoon" | "power_hour" | "after_hours" | "closed";
+
+export interface TimeOfDayInfo {
+  zone: TradingZone;
+  aggression: "high" | "moderate" | "low" | "avoid";
+  description: string;
+}
+
+export function getTimeOfDay(): TimeOfDayInfo {
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour: "numeric",
+    minute: "numeric",
+    weekday: "short",
+    hour12: false,
+  }).formatToParts(now);
+
+  const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
+  const weekday = get("weekday");
+  const hours = parseInt(get("hour"), 10);
+  const minutes = parseInt(get("minute"), 10);
+  const timeNum = hours * 100 + minutes;
+
+  if (weekday === "Sat" || weekday === "Sun") {
+    return { zone: "closed", aggression: "avoid", description: "Weekend — market closed" };
+  }
+
+  if (timeNum < 400) return { zone: "closed", aggression: "avoid", description: "Market closed" };
+  if (timeNum < 930) return { zone: "pre_market", aggression: "low", description: "Pre-market — scan for gaps, don't trade aggressively" };
+  if (timeNum < 945) return { zone: "opening_rush", aggression: "low", description: "Opening 15 min — volatile, wide spreads, wait for setups to form" };
+  if (timeNum < 1100) return { zone: "morning_momentum", aggression: "high", description: "Best trading window — momentum plays, breakouts, gap-and-go" };
+  if (timeNum < 1400) return { zone: "midday_lull", aggression: "low", description: "Lunch lull — low volume, choppy, reduce size or sit out" };
+  if (timeNum < 1530) return { zone: "afternoon", aggression: "moderate", description: "Afternoon — volume returning, institutional flow starting" };
+  if (timeNum < 1600) return { zone: "power_hour", aggression: "high", description: "Power hour — strong moves, MOC imbalances, good for closing or catching trends" };
+  if (timeNum < 2000) return { zone: "after_hours", aggression: "low", description: "After hours — thin liquidity, wide spreads" };
+  return { zone: "closed", aggression: "avoid", description: "Market closed" };
+}
+
 export interface RiskConfig {
   maxDailyLoss: number;
   maxDailyLossPct: number;
@@ -284,6 +327,14 @@ export function preTradeRiskCheck(
     );
   }
 
+  // --- Time-of-day awareness ---
+  const tod = getTimeOfDay();
+  if (tod.aggression === "avoid") {
+    blocks.push(`Market is closed (${tod.description}). No trades.`);
+  } else if (tod.aggression === "low") {
+    warnings.push(`Time-of-day: ${tod.description}. Consider reducing size or waiting.`);
+  }
+
   return {
     allowed: blocks.length === 0,
     warnings,
@@ -360,8 +411,11 @@ export function formatRiskReport(portfolioRisk: PortfolioRisk): string {
           ? "HIGH"
           : "CRITICAL";
 
+  const tod = getTimeOfDay();
   lines.push(`*Portfolio Risk Report*`);
   lines.push(`Risk Score: *${portfolioRisk.riskScore}/100* (${riskLabel})`);
+  lines.push(`Trading Zone: ${tod.zone} (${tod.aggression} aggression)`);
+  lines.push(`${tod.description}`);
   lines.push("");
 
   // Account summary

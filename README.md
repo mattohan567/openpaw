@@ -26,7 +26,7 @@ Built on the same [Pi SDK](https://github.com/badlogic/pi-mono) agent engine as 
 │  └────┬─────┘  └────┬─────┘  └───────┬───────┘  │
 │       │              │                │          │
 │  ┌────┴──────────────┴────────────────┴───────┐  │
-│  │            46 Tools                         │  │
+│  │            49 Tools                         │  │
 │  │  Trading · Market Data · Portfolio · Risk   │  │
 │  │  Research · Alerts · Memory · Quant · Web   │  │
 │  └────┬───────────────────────────────┬───────┘  │
@@ -121,7 +121,7 @@ This single command starts:
 - WhatsApp connection (scans QR code on first run)
 - Heartbeat cron jobs (every 15 min during market hours)
 
-## Tools (46 total)
+## Tools (49 total)
 
 ### Trading (6)
 `buy_stock` · `sell_stock` · `bracket_order` · `get_orders` · `cancel_order` · `get_market_calendar`
@@ -132,10 +132,10 @@ This single command starts:
 ### Portfolio (8)
 `get_account` · `get_positions` · `get_position` · `close_position` · `get_portfolio_history` · `get_watchlist` · `add_to_watchlist` · `remove_from_watchlist` · `clear_watchlist`
 
-### Quant Analysis (3) — Python sidecar
-`quant_analyze` · `quant_technical` · `quant_fundamentals`
+### Quant Analysis (6) — Python sidecar
+`quant_analyze` · `quant_technical` · `quant_fundamentals` · `get_vwap` · `scan_gaps` · `calc_position_size`
 
-5-strategy technical ensemble (trend following, mean reversion, momentum, volatility regime, statistical arbitrage) + fundamental scoring (profitability, growth, health, valuation) + headline sentiment. Pure math — no LLM calls. Data from yfinance.
+5-strategy technical ensemble + fundamental scoring + sentiment. VWAP with bands for intraday bias. Gap scanner for pre-market setups. ATR-based position sizing with stop-loss and take-profit levels. Pure math — no LLM calls. Data from yfinance.
 
 ### Backtesting (2) — Python sidecar
 `backtest_strategy` · `optimize_strategy`
@@ -147,6 +147,8 @@ Test strategies against historical data before trading. Built-in strategies: RSI
 
 ### Risk Management (3)
 `get_risk_report` · `check_trade_risk` · `get_trade_analytics`
+
+Risk reports include time-of-day trading zones (morning momentum, lunch lull, power hour) and drawdown circuit breaker. Pre-trade checks block trades during unfavorable times.
 
 ### Alerts (5)
 `set_price_alert` · `get_alerts` · `remove_alert` · `get_live_price` · `stream_symbols`
