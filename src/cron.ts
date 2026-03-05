@@ -9,7 +9,8 @@
 
 import { CronJob } from "cron";
 import { isMarketHours, type OpenPawConfig } from "./config.js";
-import { runAgentTurn, loadHeartbeatPrompt } from "./agent.js";
+import { loadHeartbeatPrompt } from "./agent.js";
+import type { AgentRunResult } from "./agent.js";
 import type { Agent } from "@mariozechner/pi-agent-core";
 import type { SessionStore } from "./session.js";
 import type { Tool } from "./tools/types.js";
@@ -20,22 +21,36 @@ export interface HeartbeatContext {
   sendWhatsApp: (text: string) => Promise<void>;
   agent: Agent;
   session: SessionStore;
+  enqueueTurn: (
+    userMessage: string,
+    callbacks?: {
+      onTextDelta?: (delta: string) => void;
+      onToolUse?: (toolName: string) => void;
+      onAgentEnd?: () => void;
+    },
+  ) => Promise<AgentRunResult>;
 }
 
 function isQuietHours(): boolean {
-  const now = new Date();
-  const eastern = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
-  const hour = eastern.getHours();
-  // 11 PM - 7 AM ET = quiet hours (no heartbeats at all)
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour: "numeric",
+    hour12: false,
+  });
+  const hour = parseInt(formatter.format(new Date()), 10);
   return hour >= 23 || hour < 7;
 }
 
 export function startHeartbeat(ctx: HeartbeatContext): CronJob {
   const interval = ctx.config.cron.heartbeatMinutes;
+  let running = false;
 
   const job = new CronJob(`*/${interval} * * * *`, async () => {
-    // Respect quiet hours — don't burn API credits overnight
     if (isQuietHours()) return;
+    if (running) {
+      console.log("[Heartbeat] Previous heartbeat still running, skipping.");
+      return;
+    }
 
     const marketOpen = isMarketHours();
     const prompt = marketOpen
@@ -52,19 +67,17 @@ Only message the owner if you found something genuinely actionable for tomorrow.
 
     console.log(`[Heartbeat] Running at ${new Date().toISOString()} (market ${marketOpen ? "open" : "closed"})`);
 
+    running = true;
     try {
-      const result = await runAgentTurn(
-        ctx.agent,
-        ctx.session,
-        prompt,
-        ctx.config,
-      );
+      const result = await ctx.enqueueTurn(prompt);
 
       if (result.response.trim()) {
         await ctx.sendWhatsApp(result.response);
       }
     } catch (err) {
       console.error("[Heartbeat] Error:", err);
+    } finally {
+      running = false;
     }
   });
 
@@ -81,11 +94,8 @@ export function startMarketOpenJob(ctx: HeartbeatContext): CronJob | null {
     async () => {
       console.log("[Cron] Market open - morning scan.");
       try {
-        const result = await runAgentTurn(
-          ctx.agent,
-          ctx.session,
+        const result = await ctx.enqueueTurn(
           "Market just opened. Check the portfolio, scan watchlist for pre-market movers, check overnight news on our holdings. Send me a brief morning briefing. Save a summary to today's daily log.",
-          ctx.config,
         );
         if (result.response.trim()) {
           await ctx.sendWhatsApp(result.response);
@@ -112,11 +122,8 @@ export function startMarketCloseJob(ctx: HeartbeatContext): CronJob | null {
     async () => {
       console.log("[Cron] Market close - daily report.");
       try {
-        const result = await runAgentTurn(
-          ctx.agent,
-          ctx.session,
+        const result = await ctx.enqueueTurn(
           "Market just closed. End-of-day report: portfolio P&L today, trades executed, notable movers on watchlist, any after-hours news. Save the report to daily log and update curated memory with new insights.",
-          ctx.config,
         );
         if (result.response.trim()) {
           await ctx.sendWhatsApp(result.response);

@@ -26,7 +26,9 @@ export async function connectWhatsApp(config: OpenPawConfig): Promise<WhatsAppCl
   let sock!: WASocket;
   let onConnected: (() => void) | null = null;
   // Track message IDs sent by the bot so we don't respond to our own replies
+  // Bounded to prevent memory leak over long runtime
   const sentMessageIds = new Set<string>();
+  const MAX_SENT_IDS = 200;
 
   function createSocket(): WASocket {
     sock = makeWASocket({
@@ -93,10 +95,10 @@ export async function connectWhatsApp(config: OpenPawConfig): Promise<WhatsAppCl
         if (!text.trim()) continue;
 
         // Send read receipt
-        await sock.readMessages([msg.key]);
+        try { await sock.readMessages([msg.key]); } catch {}
 
         // Send composing indicator
-        await sock.sendPresenceUpdate("composing", sender);
+        try { await sock.sendPresenceUpdate("composing", sender); } catch {}
 
         if (messageHandler) {
           try {
@@ -107,7 +109,7 @@ export async function connectWhatsApp(config: OpenPawConfig): Promise<WhatsAppCl
         }
 
         // Clear composing
-        await sock.sendPresenceUpdate("paused", sender);
+        try { await sock.sendPresenceUpdate("paused", sender); } catch {}
       }
     });
 
@@ -134,7 +136,14 @@ export async function connectWhatsApp(config: OpenPawConfig): Promise<WhatsAppCl
       const chunks = chunkText(text, 4000);
       for (const chunk of chunks) {
         const sent = await sock.sendMessage(ownerJid, { text: chunk });
-        if (sent?.key?.id) sentMessageIds.add(sent.key.id);
+        if (sent?.key?.id) {
+          sentMessageIds.add(sent.key.id);
+          // Evict oldest IDs if over limit
+          if (sentMessageIds.size > MAX_SENT_IDS) {
+            const first = sentMessageIds.values().next().value;
+            if (first) sentMessageIds.delete(first);
+          }
+        }
       }
     },
     onMessage: (handler) => {

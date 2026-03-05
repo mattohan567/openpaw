@@ -70,16 +70,22 @@ export function createAlpacaTradingTools(config: OpenPawConfig): Tool[] {
         const portfolioValue = Number(account.portfolio_value);
 
         // Estimate order cost
-        const quoteRes = (await fetch(`https://data.alpaca.markets/v2/stocks/${symbol}/quotes/latest`, {
+        const quoteRes = await fetch(`https://data.alpaca.markets/v2/stocks/${symbol}/quotes/latest`, {
           headers: {
             "APCA-API-KEY-ID": config.trading.alpacaApiKey,
             "APCA-API-SECRET-KEY": config.trading.alpacaSecretKey,
           },
-        }));
+        });
+        if (!quoteRes.ok) {
+          return `Failed to get quote for ${symbol}: ${quoteRes.status}. Cannot validate trade safety.`;
+        }
         const quoteData = (await quoteRes.json()) as Record<string, Record<string, number>>;
         const price = params.limit_price
           ? Number(params.limit_price)
           : quoteData.quote?.ap || quoteData.quote?.bp || 0;
+        if (price <= 0) {
+          return `Could not determine price for ${symbol}. Cannot validate trade safety.`;
+        }
         const estimatedCost = price * qty;
 
         // Check max position size
@@ -228,10 +234,16 @@ export function createAlpacaTradingTools(config: OpenPawConfig): Tool[] {
             "APCA-API-SECRET-KEY": config.trading.alpacaSecretKey,
           },
         });
+        if (!quoteRes.ok) {
+          return `Failed to get quote for ${symbol}: ${quoteRes.status}. Cannot validate trade safety.`;
+        }
         const quoteData = (await quoteRes.json()) as Record<string, Record<string, number>>;
         const price = params.limit_price
           ? Number(params.limit_price)
           : quoteData.quote?.ap || quoteData.quote?.bp || 0;
+        if (price <= 0) {
+          return `Could not determine price for ${symbol}. Cannot validate trade safety.`;
+        }
         const estimatedCost = price * qty;
 
         if (estimatedCost > config.trading.maxPositionSize) {

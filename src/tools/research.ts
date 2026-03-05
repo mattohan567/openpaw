@@ -82,10 +82,6 @@ export function createResearchTools(config: OpenPawConfig): Tool[] {
         const daysAhead = (params.days_ahead as number) || 14;
 
         try {
-          // Use Alpaca's corporate actions calendar for earnings
-          const start = getToday();
-          const end = getDateDaysFromNow(daysAhead);
-
           if (symbols) {
             // Check news for earnings mentions for specific symbols
             const newsRes = await fetch(
@@ -369,10 +365,6 @@ function getToday(): string {
 
 function getDateDaysAgo(days: number): string {
   return new Date(Date.now() - days * 86400000).toISOString().split("T")[0];
-}
-
-function getDateDaysFromNow(days: number): string {
-  return new Date(Date.now() + days * 86400000).toISOString().split("T")[0];
 }
 
 function avg(arr: number[]): number {

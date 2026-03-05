@@ -12,16 +12,15 @@
  */
 
 import { createServer, type Server } from "node:http";
-import { WebSocketServer, type WebSocket } from "ws";
+import { WebSocketServer, WebSocket } from "ws";
 import { loadConfig, type OpenPawConfig } from "./config.js";
 import { connectWhatsApp, type WhatsAppClient } from "./whatsapp.js";
 import { createOpenPawTools } from "./tools/index.js";
-import { createAgent, restoreSession, runAgentTurn } from "./agent.js";
+import { createAgent, restoreSession, runAgentTurn, type AgentRunResult } from "./agent.js";
 import type { Agent } from "@mariozechner/pi-agent-core";
-import { openSession } from "./session.js";
+import { openSession, type SessionStore } from "./session.js";
 import { startHeartbeat, startMarketOpenJob, startMarketCloseJob } from "./cron.js";
 import { AlpacaStream } from "./streaming.js";
-import type { Tool } from "./tools/types.js";
 
 export interface GatewayServer {
   httpServer: Server;
@@ -30,6 +29,34 @@ export interface GatewayServer {
   stream: AlpacaStream | null;
   config: OpenPawConfig;
   close: () => Promise<void>;
+}
+
+/**
+ * Mutex for agent turns. The Pi SDK Agent is NOT safe for concurrent prompt() calls.
+ * All agent interactions (WhatsApp, WebSocket, heartbeat, alerts) must be serialized.
+ */
+function createTurnQueue(
+  agent: Agent,
+  session: SessionStore,
+  config: OpenPawConfig,
+) {
+  let queue: Promise<void> = Promise.resolve();
+
+  return function enqueue(
+    userMessage: string,
+    callbacks?: Parameters<typeof runAgentTurn>[4],
+  ): Promise<AgentRunResult> {
+    return new Promise<AgentRunResult>((resolve, reject) => {
+      queue = queue.then(async () => {
+        try {
+          const result = await runAgentTurn(agent, session, userMessage, config, callbacks);
+          resolve(result);
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+  };
 }
 
 export async function startGateway(): Promise<GatewayServer> {
@@ -53,7 +80,6 @@ export async function startGateway(): Promise<GatewayServer> {
 
     stream.on("connected", () => {
       console.log("[Stream] Connected to Alpaca real-time data.");
-      // Auto-subscribe to watchlist if configured
       if (config.streaming.streamWatchlist && config.trading.watchlist.length > 0) {
         stream!.subscribe(config.trading.watchlist);
         console.log(`[Stream] Streaming watchlist: ${config.trading.watchlist.join(", ")}`);
@@ -82,6 +108,9 @@ export async function startGateway(): Promise<GatewayServer> {
     console.log(`[Gateway] Agent context restored with ${restored} messages.`);
   }
 
+  // Serialized agent turn queue — prevents concurrent access
+  const enqueueTurn = createTurnQueue(agent, session, config);
+
   // Connect WhatsApp (if configured)
   let whatsapp: WhatsAppClient | null = null;
 
@@ -90,14 +119,12 @@ export async function startGateway(): Promise<GatewayServer> {
     try {
       whatsapp = await connectWhatsApp(config);
 
-      // Wire up: incoming WhatsApp messages → agent → streaming reply
       whatsapp.onMessage(async (text: string) => {
         console.log(`\n[WhatsApp] >>> Owner: ${text}`);
 
         try {
-          const result = await runAgentTurn(agent, session, text, config, {
+          const result = await enqueueTurn(text, {
             onTextDelta: (delta) => {
-              // Stream to terminal only, not WhatsApp
               process.stdout.write(delta);
             },
             onToolUse: (toolName) => {
@@ -107,15 +134,16 @@ export async function startGateway(): Promise<GatewayServer> {
 
           console.log(`\n[Agent] Done. Tools used: ${result.toolsUsed.length ? result.toolsUsed.join(", ") : "none"}`);
 
-          // Send only the final response to WhatsApp
           if (result.response.trim()) {
             await whatsapp!.sendMessage(result.response);
           }
         } catch (err) {
           console.error("[Agent] Error:", err);
-          await whatsapp!.sendMessage(
-            `Error processing your request: ${err instanceof Error ? err.message : "Unknown error"}`,
-          );
+          try {
+            await whatsapp!.sendMessage(
+              `Error processing your request: ${err instanceof Error ? err.message : "Unknown error"}`,
+            );
+          } catch {}
         }
       });
 
@@ -131,7 +159,11 @@ export async function startGateway(): Promise<GatewayServer> {
   // Notification helper
   const sendWhatsApp = async (text: string) => {
     if (whatsapp) {
-      await whatsapp.sendMessage(text);
+      try {
+        await whatsapp.sendMessage(text);
+      } catch (err) {
+        console.error("[WhatsApp] Send failed:", err);
+      }
     } else {
       console.log(`[Notification] ${text}`);
     }
@@ -145,17 +177,11 @@ export async function startGateway(): Promise<GatewayServer> {
       const msg = `*Alert* ${alert.symbol} ${alert.condition} $${alert.price.toFixed(2)} — now $${currentPrice.toFixed(2)}${alert.message ? `\n${alert.message}` : ""}`;
 
       console.log(`[Alert] ${msg}`);
-
-      // Notify via WhatsApp
       await sendWhatsApp(msg);
 
-      // Also tell the agent so it can decide what to do
       try {
-        const result = await runAgentTurn(
-          agent,
-          session,
+        const result = await enqueueTurn(
           `PRICE ALERT TRIGGERED: ${alert.symbol} ${alert.condition} $${alert.price.toFixed(2)}. Current price: $${currentPrice.toFixed(2)}.${alert.message ? ` Context: ${alert.message}` : ""} — Should you act on this?`,
-          config,
         );
         if (result.response.trim()) {
           await sendWhatsApp(result.response);
@@ -166,8 +192,8 @@ export async function startGateway(): Promise<GatewayServer> {
     });
   }
 
-  // Start cron jobs
-  const cronCtx = { config, tools, sendWhatsApp, agent, session };
+  // Start cron jobs — pass enqueueTurn so heartbeats are serialized too
+  const cronCtx = { config, tools, sendWhatsApp, agent, session, enqueueTurn };
   const heartbeatJob = startHeartbeat(cronCtx);
   const marketOpenJob = startMarketOpenJob(cronCtx);
   const marketCloseJob = startMarketCloseJob(cronCtx);
@@ -218,48 +244,65 @@ export async function startGateway(): Promise<GatewayServer> {
         const msg = JSON.parse(data.toString());
 
         if (msg.type === "message") {
-          const result = await runAgentTurn(agent, session, msg.text, config, {
+          const result = await enqueueTurn(msg.text, {
             onTextDelta: (delta) => {
-              ws.send(JSON.stringify({ type: "stream", delta }));
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: "stream", delta }));
+              }
             },
             onToolUse: (toolName) => {
-              ws.send(JSON.stringify({ type: "tool_use", tool: toolName }));
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: "tool_use", tool: toolName }));
+              }
             },
           });
-          ws.send(JSON.stringify({
-            type: "response",
-            text: result.response,
-            toolsUsed: result.toolsUsed,
-          }));
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: "response",
+              text: result.response,
+              toolsUsed: result.toolsUsed,
+            }));
+          }
         }
 
         if (msg.type === "status") {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                type: "status",
+                whatsapp: !!whatsapp,
+                streaming: !!stream,
+                tools: tools.length,
+                sessionTurns: session.turnCount,
+                alerts: stream?.getAlerts().length ?? 0,
+                uptime: process.uptime(),
+              }),
+            );
+          }
+        }
+      } catch (err) {
+        if (ws.readyState === WebSocket.OPEN) {
           ws.send(
             JSON.stringify({
-              type: "status",
-              whatsapp: !!whatsapp,
-              streaming: !!stream,
-              tools: tools.length,
-              sessionTurns: session.turnCount,
-              alerts: stream?.getAlerts().length ?? 0,
-              uptime: process.uptime(),
+              type: "error",
+              error: err instanceof Error ? err.message : "Unknown error",
             }),
           );
         }
-      } catch (err) {
-        ws.send(
-          JSON.stringify({
-            type: "error",
-            error: err instanceof Error ? err.message : "Unknown error",
-          }),
-        );
       }
     });
   });
 
-  // Signal handling
-  const shutdown = async () => {
-    console.log("\n[Gateway] Shutting down gracefully...");
+  await new Promise<void>((resolve, reject) => {
+    httpServer.once("error", reject);
+    httpServer.listen(config.gateway.port, config.gateway.host, () => {
+      console.log(`[Gateway] Listening on ${config.gateway.host}:${config.gateway.port}`);
+      resolve();
+    });
+  });
+
+  const close = async () => {
+    console.log("[Gateway] Shutting down gracefully...");
     try {
       await agent.waitForIdle();
     } catch {}
@@ -271,19 +314,7 @@ export async function startGateway(): Promise<GatewayServer> {
     httpServer.close();
     if (whatsapp) await whatsapp.close();
     console.log("[Gateway] Shut down.");
-    process.exit(0);
   };
-
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
-
-  await new Promise<void>((resolve, reject) => {
-    httpServer.once("error", reject);
-    httpServer.listen(config.gateway.port, config.gateway.host, () => {
-      console.log(`[Gateway] Listening on ${config.gateway.host}:${config.gateway.port}`);
-      resolve();
-    });
-  });
 
   return {
     httpServer,
@@ -291,15 +322,6 @@ export async function startGateway(): Promise<GatewayServer> {
     whatsapp,
     stream,
     config,
-    close: async () => {
-      heartbeatJob.stop();
-      marketOpenJob?.stop();
-      marketCloseJob?.stop();
-      if (stream) stream.close();
-      wss.close();
-      httpServer.close();
-      if (whatsapp) await whatsapp.close();
-      console.log("[Gateway] Shut down.");
-    },
+    close,
   };
 }

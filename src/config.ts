@@ -119,7 +119,7 @@ export function loadConfig(): OpenPawConfig {
 
   if (!existsSync(CONFIG_PATH)) {
     writeFileSync(CONFIG_PATH, JSON5.stringify(DEFAULT_CONFIG, null, 2));
-    return { ...DEFAULT_CONFIG };
+    return structuredClone(DEFAULT_CONFIG);
   }
 
   const raw = readFileSync(CONFIG_PATH, "utf-8");
@@ -128,7 +128,11 @@ export function loadConfig(): OpenPawConfig {
     ...DEFAULT_CONFIG,
     ...parsed,
     trading: { ...DEFAULT_CONFIG.trading, ...parsed.trading },
+    whatsapp: { ...DEFAULT_CONFIG.whatsapp, ...parsed.whatsapp },
+    agent: { ...DEFAULT_CONFIG.agent, ...parsed.agent },
+    cron: { ...DEFAULT_CONFIG.cron, ...parsed.cron },
     risk: { ...DEFAULT_CONFIG.risk, ...parsed.risk },
+    gateway: { ...DEFAULT_CONFIG.gateway, ...parsed.gateway },
     streaming: { ...DEFAULT_CONFIG.streaming, ...parsed.streaming },
   };
 }
@@ -140,13 +144,21 @@ export function saveConfig(config: OpenPawConfig): void {
 
 export function isMarketHours(): boolean {
   const now = new Date();
-  const eastern = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
-  const day = eastern.getDay();
-  const hours = eastern.getHours();
-  const minutes = eastern.getMinutes();
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour: "numeric",
+    minute: "numeric",
+    weekday: "short",
+    hour12: false,
+  }).formatToParts(now);
+
+  const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
+  const weekday = get("weekday");
+  const hours = parseInt(get("hour"), 10);
+  const minutes = parseInt(get("minute"), 10);
   const timeNum = hours * 100 + minutes;
 
   // Weekdays 9:30 AM - 4:00 PM ET
-  if (day === 0 || day === 6) return false;
+  if (weekday === "Sat" || weekday === "Sun") return false;
   return timeNum >= 930 && timeNum < 1600;
 }

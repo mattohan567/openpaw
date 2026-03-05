@@ -41,6 +41,9 @@ export function createRiskTools(config: OpenPawConfig): Tool[] {
             fetch(`${config.trading.alpacaBaseUrl}/v2/positions`, { headers: alpacaHeaders(config) }),
           ]);
 
+          if (!accountRes.ok) return `Alpaca account API error: ${accountRes.status}`;
+          if (!positionsRes.ok) return `Alpaca positions API error: ${positionsRes.status}`;
+
           const account = (await accountRes.json()) as Record<string, unknown>;
           const positions = (await positionsRes.json()) as Record<string, unknown>[];
 
@@ -72,6 +75,9 @@ export function createRiskTools(config: OpenPawConfig): Tool[] {
             fetch(`${config.trading.alpacaBaseUrl}/v2/account`, { headers: alpacaHeaders(config) }),
             fetch(`${config.trading.alpacaBaseUrl}/v2/positions`, { headers: alpacaHeaders(config) }),
           ]);
+
+          if (!accountRes.ok) return `Alpaca account API error: ${accountRes.status}`;
+          if (!positionsRes.ok) return `Alpaca positions API error: ${positionsRes.status}`;
 
           const account = (await accountRes.json()) as Record<string, unknown>;
           const positions = (await positionsRes.json()) as Record<string, unknown>[];

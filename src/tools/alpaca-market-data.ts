@@ -21,17 +21,6 @@ async function dataRequest(config: OpenPawConfig, path: string): Promise<unknown
   return res.json();
 }
 
-async function alpacaScreener(config: OpenPawConfig, path: string): Promise<unknown> {
-  const res = await fetch(`https://paper-api.alpaca.markets${path}`, {
-    headers: dataHeaders(config),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Alpaca Screener ${path}: ${res.status} ${text}`);
-  }
-  return res.json();
-}
-
 export function createMarketDataTools(config: OpenPawConfig): Tool[] {
   return [
     {

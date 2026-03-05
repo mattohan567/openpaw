@@ -48,6 +48,9 @@ export function createMemoryTools(): Tool[] {
           path = todayFile();
         } else if (source.startsWith("daily:")) {
           const date = source.slice(6);
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+            return "Invalid date format. Use 'daily:YYYY-MM-DD'.";
+          }
           path = join(MEMORY_DIR, `${date}.md`);
         } else {
           return "Invalid source. Use 'curated', 'daily', or 'daily:YYYY-MM-DD'.";

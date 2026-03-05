@@ -13,7 +13,6 @@ import { appendFileSync, readFileSync, existsSync, mkdirSync, writeFileSync } fr
 import { join } from "node:path";
 import { STATE_DIR } from "./config.js";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { Message } from "@mariozechner/pi-ai";
 
 const SESSIONS_DIR = join(STATE_DIR, "sessions");
 
