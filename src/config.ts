@@ -24,6 +24,7 @@ export interface AgentConfig {
   model: string;
   maxTokens: number;
   systemPromptFile: string; // path to SOUL.md or similar
+  thinkingLevel: "off" | "low" | "medium" | "high"; // extended thinking for complex decisions
 }
 
 export interface CronConfig {
@@ -83,6 +84,7 @@ const DEFAULT_CONFIG: OpenPawConfig = {
     model: "grok-3-fast",
     maxTokens: 4096,
     systemPromptFile: join(STATE_DIR, "SOUL.md"),
+    thinkingLevel: "off",
   },
   cron: {
     heartbeatMinutes: 15,

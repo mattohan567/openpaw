@@ -251,5 +251,198 @@ export function createQuantTools(): Tool[] {
         }
       },
     },
+    {
+      name: "get_regime",
+      description:
+        "HMM-based regime detection for a stock. Uses a 3-state Hidden Markov Model trained on returns + volatility to classify current state as bull, bear, or sideways. Returns dynamic strategy weights optimized for the detected regime. Run this to know which strategies to favor.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          symbol: { type: "string", description: "Stock ticker symbol" },
+          period: { type: "string", description: "Training period: 6mo, 1y, 2y (default: 1y)" },
+        },
+        required: ["symbol"],
+      },
+      execute: async (params) => {
+        const symbol = (params.symbol as string).toUpperCase();
+        const period = (params.period as string) || "1y";
+        try {
+          return await quantRequest(`/regime/${symbol}?period=${period}`);
+        } catch (err) {
+          return `Regime detection failed (is the quant service running on port 8200?): ${err instanceof Error ? err.message : "unknown"}`;
+        }
+      },
+    },
+    {
+      name: "get_correlations",
+      description:
+        "Get pairwise correlation matrix for a set of stocks. Identifies highly correlated pairs (>0.7) that increase portfolio risk. Returns a diversification score. Use this to check if your positions are too similar.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          symbols: {
+            type: "string",
+            description: 'Comma-separated symbols, e.g. "AAPL,NVDA,MSFT,GOOGL"',
+          },
+        },
+        required: ["symbols"],
+      },
+      execute: async (params) => {
+        const symbols = (params.symbols as string).split(",").map((s) => s.trim().toUpperCase());
+        try {
+          const res = await fetch(`${QUANT_BASE}/correlation`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ symbols }),
+          });
+          if (!res.ok) {
+            const text = await res.text();
+            throw new Error(`Correlation ${res.status}: ${text}`);
+          }
+          return JSON.stringify(await res.json());
+        } catch (err) {
+          return `Correlation analysis failed (is the quant service running on port 8200?): ${err instanceof Error ? err.message : "unknown"}`;
+        }
+      },
+    },
+    {
+      name: "optimize_portfolio",
+      description:
+        "Mean-variance portfolio optimization. Given a set of stocks, finds the max Sharpe ratio and min variance portfolios with optimal weights. Optionally provide current weights to get specific rebalance trades.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          symbols: {
+            type: "string",
+            description: 'Comma-separated symbols, e.g. "AAPL,NVDA,MSFT"',
+          },
+          current_weights: {
+            type: "string",
+            description: 'Current portfolio weights as JSON, e.g. \'{"AAPL":0.3,"NVDA":0.7}\'. Omit if no current positions.',
+          },
+        },
+        required: ["symbols"],
+      },
+      execute: async (params) => {
+        const symbols = (params.symbols as string).split(",").map((s) => s.trim().toUpperCase());
+        const body: Record<string, unknown> = { symbols };
+        if (params.current_weights) {
+          try {
+            body.current_weights = JSON.parse(params.current_weights as string);
+          } catch {
+            return 'Invalid current_weights JSON. Example: {"AAPL":0.3,"NVDA":0.7}';
+          }
+        }
+        try {
+          const res = await fetch(`${QUANT_BASE}/portfolio_optimize`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          if (!res.ok) {
+            const text = await res.text();
+            throw new Error(`Portfolio optimize ${res.status}: ${text}`);
+          }
+          return JSON.stringify(await res.json());
+        } catch (err) {
+          return `Portfolio optimization failed (is the quant service running on port 8200?): ${err instanceof Error ? err.message : "unknown"}`;
+        }
+      },
+    },
+    {
+      name: "walkforward_backtest",
+      description:
+        "Walk-forward backtesting with overfitting detection. Splits data into N folds, trains on each fold, tests on the next. Compares in-sample vs out-of-sample performance — a >50% gap means the strategy is likely overfit. PREFER this over single-pass backtest_strategy.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          symbol: { type: "string", description: "Stock ticker symbol" },
+          strategy: {
+            type: "string",
+            description: "Strategy: rsi, sma_crossover, bollinger, momentum, mean_reversion",
+          },
+          params: {
+            type: "string",
+            description: 'Strategy params as JSON string. Omit for defaults.',
+          },
+          period: { type: "string", description: "Data period (default: 2y — longer is better for walk-forward)" },
+          n_folds: { type: "number", description: "Number of folds (default: 5)" },
+        },
+        required: ["symbol", "strategy"],
+      },
+      execute: async (params) => {
+        const body: Record<string, unknown> = {
+          symbol: (params.symbol as string).toUpperCase(),
+          strategy: params.strategy as string,
+          period: (params.period as string) || "2y",
+          n_folds: (params.n_folds as number) || 5,
+          initial_capital: 10000,
+        };
+        if (params.params) {
+          try {
+            body.params = JSON.parse(params.params as string);
+          } catch {
+            return "Invalid params JSON.";
+          }
+        }
+        try {
+          return await backtestRequest("/walkforward", body);
+        } catch (err) {
+          return `Walk-forward backtest failed (is the backtest service running on port 8300?): ${err instanceof Error ? err.message : "unknown"}`;
+        }
+      },
+    },
+    {
+      name: "get_earnings",
+      description:
+        "Get upcoming earnings date and recent earnings history for a stock. Shows EPS estimates, actuals, and surprise %. Warns if earnings are within 3 days — high gap risk. Check this BEFORE buying any stock.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          symbol: { type: "string", description: "Stock ticker symbol" },
+        },
+        required: ["symbol"],
+      },
+      execute: async (params) => {
+        const symbol = (params.symbol as string).toUpperCase();
+        try {
+          return await quantRequest(`/earnings/${symbol}`);
+        } catch (err) {
+          return `Earnings lookup failed (is the quant service running on port 8200?): ${err instanceof Error ? err.message : "unknown"}`;
+        }
+      },
+    },
+    {
+      name: "check_earnings_risk",
+      description:
+        "Check multiple symbols for upcoming earnings. Returns warnings for any reporting within 7 days. Use this on all held positions to avoid earnings surprises.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          symbols: {
+            type: "string",
+            description: 'Comma-separated symbols to check, e.g. "AAPL,NVDA,TSLA"',
+          },
+        },
+        required: ["symbols"],
+      },
+      execute: async (params) => {
+        const symbols = (params.symbols as string).split(",").map((s) => s.trim().toUpperCase());
+        try {
+          const res = await fetch(`${QUANT_BASE}/earnings_check`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ symbols }),
+          });
+          if (!res.ok) {
+            const text = await res.text();
+            throw new Error(`Earnings check ${res.status}: ${text}`);
+          }
+          return JSON.stringify(await res.json());
+        } catch (err) {
+          return `Earnings check failed (is the quant service running on port 8200?): ${err instanceof Error ? err.message : "unknown"}`;
+        }
+      },
+    },
   ];
 }

@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
 from stockstats import StockDataFrame
 
 # ---------------------------------------------------------------------------
@@ -1072,6 +1073,970 @@ async def position_size(
         raise
     except Exception as e:
         logger.exception("Position sizing failed for %s", symbol)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Macro analysis
+# ---------------------------------------------------------------------------
+
+SECTOR_ETFS = {
+    "XLK": "Technology", "XLV": "Healthcare", "XLF": "Financials",
+    "XLE": "Energy", "XLI": "Industrials", "XLP": "Consumer Staples",
+    "XLY": "Consumer Discretionary", "XLU": "Utilities", "XLB": "Materials",
+    "XLRE": "Real Estate", "XLC": "Communication Services",
+}
+
+DEFENSIVE_SECTORS = {"XLP", "XLU", "XLV", "XLRE"}
+OFFENSIVE_SECTORS = {"XLK", "XLY", "XLE", "XLI", "XLF", "XLB", "XLC"}
+
+
+@app.get("/regime")
+async def regime():
+    """Market regime detection: risk-on, risk-off, or transition."""
+    try:
+        # Get VIX
+        vix_ticker = yf.Ticker("^VIX")
+        vix_hist = vix_ticker.history(period="5d")
+        vix_level = float(vix_hist["Close"].iloc[-1]) if not vix_hist.empty else 20.0
+
+        # Get SPY analysis
+        spy_df = _fetch_history("SPY", "3mo")
+        spy_sdf = _to_stockstats(spy_df)
+        spy_rsi = float(spy_sdf["rsi_14"].iloc[-1])
+        spy_ema8 = float(spy_sdf["close_8_ema"].iloc[-1])
+        spy_ema21 = float(spy_sdf["close_21_ema"].iloc[-1])
+        spy_price = float(spy_df["close"].iloc[-1])
+        spy_trend = "bullish" if spy_ema8 > spy_ema21 else "bearish"
+
+        # Determine regime
+        if vix_level < 15 and spy_trend == "bullish" and spy_rsi > 50:
+            regime = "risk_on"
+            description = "Low volatility, bullish trend. Favorable for aggressive positioning."
+        elif vix_level > 25 or (spy_trend == "bearish" and spy_rsi < 40):
+            regime = "risk_off"
+            description = "High volatility or bearish trend. Reduce size, avoid speculative plays."
+        else:
+            regime = "transition"
+            description = "Mixed signals. Use normal sizing, be selective."
+
+        # Size recommendation
+        if regime == "risk_on":
+            size_modifier = 1.0
+        elif regime == "risk_off":
+            size_modifier = 0.5
+        else:
+            size_modifier = 0.75
+
+        return {
+            "regime": regime,
+            "description": description,
+            "size_modifier": size_modifier,
+            "vix": round(vix_level, 2),
+            "spy": {
+                "price": round(spy_price, 2),
+                "rsi_14": round(spy_rsi, 2),
+                "ema8": round(spy_ema8, 2),
+                "ema21": round(spy_ema21, 2),
+                "trend": spy_trend,
+            },
+        }
+    except Exception as e:
+        logger.exception("Regime detection failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sectors")
+async def sectors():
+    """Sector rotation: ranks sector ETFs, identifies leadership type."""
+    try:
+        results = []
+        for etf, name in SECTOR_ETFS.items():
+            try:
+                df = _fetch_history(etf, "1mo")
+                returns_1w = float((df["close"].iloc[-1] / df["close"].iloc[-6] - 1) * 100) if len(df) >= 6 else 0
+                returns_1m = float((df["close"].iloc[-1] / df["close"].iloc[0] - 1) * 100)
+                results.append({
+                    "etf": etf,
+                    "sector": name,
+                    "return_1w": round(returns_1w, 2),
+                    "return_1m": round(returns_1m, 2),
+                    "is_defensive": etf in DEFENSIVE_SECTORS,
+                })
+            except Exception:
+                continue
+
+        results.sort(key=lambda x: x["return_1w"], reverse=True)
+
+        # Determine leadership
+        top_3 = [r["etf"] for r in results[:3]]
+        defensive_leading = sum(1 for e in top_3 if e in DEFENSIVE_SECTORS)
+
+        if defensive_leading >= 2:
+            leadership = "defensive"
+            interpretation = "Defensive sectors leading — risk-off rotation. Be cautious."
+        else:
+            leadership = "offensive"
+            interpretation = "Offensive sectors leading — risk-on rotation. Favorable for growth plays."
+
+        return {
+            "sectors": results,
+            "leadership": leadership,
+            "interpretation": interpretation,
+            "top_3": [{"etf": r["etf"], "sector": r["sector"], "return_1w": r["return_1w"]} for r in results[:3]],
+            "bottom_3": [{"etf": r["etf"], "sector": r["sector"], "return_1w": r["return_1w"]} for r in results[-3:]],
+        }
+    except Exception as e:
+        logger.exception("Sector rotation failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/macro")
+async def macro_dashboard():
+    """Combined macro dashboard: regime + sectors + bonds."""
+    try:
+        # Get regime
+        regime_data = await regime()
+
+        # Get sectors
+        sector_data = await sectors()
+
+        # Get TLT (bonds)
+        try:
+            tlt_df = _fetch_history("TLT", "1mo")
+            tlt_return = float((tlt_df["close"].iloc[-1] / tlt_df["close"].iloc[0] - 1) * 100)
+            tlt_price = float(tlt_df["close"].iloc[-1])
+            bonds = {"tlt_price": round(tlt_price, 2), "tlt_return_1m": round(tlt_return, 2)}
+        except Exception:
+            bonds = {"tlt_price": None, "tlt_return_1m": None}
+
+        return {
+            "regime": regime_data,
+            "sectors": sector_data,
+            "bonds": bonds,
+            "summary": f"Regime: {regime_data['regime']}. Leadership: {sector_data['leadership']}. VIX: {regime_data['vix']}. Size modifier: {regime_data['size_modifier']}x.",
+        }
+    except Exception as e:
+        logger.exception("Macro dashboard failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# HMM Regime Detection
+# ---------------------------------------------------------------------------
+
+
+@app.get("/regime/{symbol}")
+async def symbol_regime(symbol: str, period: str = Query(default="1y")):
+    """HMM-based regime detection for individual stocks.
+
+    Uses a 3-state Hidden Markov Model trained on returns + volatility
+    to classify the current market state as bull, bear, or sideways.
+    Returns dynamic strategy weights tuned to each regime.
+    """
+    symbol = symbol.upper()
+    logger.info("HMM regime detection for %s (period=%s)", symbol, period)
+    try:
+        from hmmlearn.hmm import GaussianHMM
+
+        df = _fetch_history(symbol, period)
+        close = df["close"].values
+
+        # Features: log returns + rolling volatility (20-day)
+        log_returns = np.diff(np.log(close))
+        vol_window = 20
+        rolling_vol = pd.Series(log_returns).rolling(window=vol_window).std().values
+
+        # Trim NaN from rolling vol
+        valid_start = vol_window - 1
+        returns_trimmed = log_returns[valid_start:]
+        vol_trimmed = rolling_vol[valid_start:]
+
+        if len(returns_trimmed) < 30:
+            raise HTTPException(status_code=422, detail=f"Insufficient data for HMM: {len(returns_trimmed)} observations")
+
+        features = np.column_stack([returns_trimmed, vol_trimmed])
+
+        # Fit 3-state HMM
+        model = GaussianHMM(n_components=3, covariance_type="full", n_iter=100, random_state=42)
+        model.fit(features)
+
+        # Predict states
+        states = model.predict(features)
+        current_state = int(states[-1])
+
+        # Classify states by mean return: highest=bull, lowest=bear, middle=sideways
+        state_means = {}
+        for s in range(3):
+            mask = states == s
+            if mask.any():
+                state_means[s] = float(np.mean(returns_trimmed[mask]))
+            else:
+                state_means[s] = 0.0
+
+        sorted_states = sorted(state_means.keys(), key=lambda s: state_means[s])
+        state_labels = {}
+        state_labels[sorted_states[0]] = "bear"
+        state_labels[sorted_states[1]] = "sideways"
+        state_labels[sorted_states[2]] = "bull"
+
+        current_label = state_labels[current_state]
+
+        # Dynamic strategy weights per regime
+        regime_weights = {
+            "bull": {
+                "trend_following": 0.35,
+                "mean_reversion": 0.10,
+                "momentum": 0.35,
+                "volatility_regime": 0.05,
+                "stat_arb": 0.15,
+            },
+            "bear": {
+                "trend_following": 0.15,
+                "mean_reversion": 0.30,
+                "momentum": 0.15,
+                "volatility_regime": 0.15,
+                "stat_arb": 0.25,
+            },
+            "sideways": {
+                "trend_following": 0.10,
+                "mean_reversion": 0.35,
+                "momentum": 0.10,
+                "volatility_regime": 0.10,
+                "stat_arb": 0.35,
+            },
+        }
+
+        # State statistics
+        state_stats = {}
+        for s in range(3):
+            mask = states == s
+            label = state_labels[s]
+            if mask.any():
+                state_stats[label] = {
+                    "mean_daily_return": round(float(np.mean(returns_trimmed[mask])) * 100, 4),
+                    "volatility": round(float(np.std(returns_trimmed[mask])) * 100, 4),
+                    "days_in_state": int(mask.sum()),
+                    "pct_of_period": round(float(mask.sum() / len(states) * 100), 1),
+                }
+
+        # Transition probabilities from current state
+        trans_probs = {}
+        for s in range(3):
+            trans_probs[state_labels[s]] = round(float(model.transmat_[current_state, s]), 4)
+
+        return {
+            "symbol": symbol,
+            "period": period,
+            "current_regime": current_label,
+            "recommended_weights": regime_weights[current_label],
+            "state_statistics": state_stats,
+            "transition_probabilities": trans_probs,
+            "observations": len(returns_trimmed),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("HMM regime detection failed for %s", symbol)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Portfolio Optimization
+# ---------------------------------------------------------------------------
+
+
+class CorrelationRequest(BaseModel):
+    symbols: list[str]
+
+
+@app.post("/correlation")
+async def correlation(req: CorrelationRequest):
+    """Pairwise correlation matrix for a set of symbols."""
+    symbols = req.symbols
+    if len(symbols) < 2:
+        raise HTTPException(status_code=400, detail="Need at least 2 symbols for correlation")
+    if len(symbols) > 20:
+        raise HTTPException(status_code=400, detail="Max 20 symbols for correlation")
+
+    try:
+        closes = {}
+        for sym in symbols:
+            sym = sym.upper()
+            try:
+                df = _fetch_history(sym, "3mo")
+                closes[sym] = df["close"]
+            except Exception:
+                continue
+
+        if len(closes) < 2:
+            raise HTTPException(status_code=422, detail="Could not fetch data for enough symbols")
+
+        price_df = pd.DataFrame(closes)
+        returns_df = price_df.pct_change().dropna()
+        corr_matrix = returns_df.corr()
+
+        # Find highly correlated pairs (>0.7)
+        high_corr_pairs = []
+        syms = list(corr_matrix.columns)
+        for i in range(len(syms)):
+            for j in range(i + 1, len(syms)):
+                c = float(corr_matrix.iloc[i, j])
+                if abs(c) > 0.7:
+                    high_corr_pairs.append({
+                        "pair": [syms[i], syms[j]],
+                        "correlation": round(c, 4),
+                        "risk": "high" if abs(c) > 0.85 else "moderate",
+                    })
+
+        return {
+            "symbols": list(closes.keys()),
+            "correlation_matrix": {
+                sym: {s2: round(float(corr_matrix.loc[sym, s2]), 4) for s2 in corr_matrix.columns}
+                for sym in corr_matrix.index
+            },
+            "high_correlation_pairs": high_corr_pairs,
+            "diversification_score": round(float(1 - corr_matrix.values[np.triu_indices_from(corr_matrix.values, k=1)].mean()), 4),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Correlation analysis failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class PortfolioOptimizeRequest(BaseModel):
+    symbols: list[str]
+    current_weights: dict[str, float] | None = None
+
+
+@app.post("/portfolio_optimize")
+async def portfolio_optimize(req: PortfolioOptimizeRequest):
+    """Mean-variance portfolio optimization. Returns max Sharpe and min variance portfolios with rebalance trades."""
+    from scipy.optimize import minimize
+
+    symbols = [s.upper() for s in req.symbols]
+    if len(symbols) < 2:
+        raise HTTPException(status_code=400, detail="Need at least 2 symbols")
+    if len(symbols) > 20:
+        raise HTTPException(status_code=400, detail="Max 20 symbols")
+
+    try:
+        closes = {}
+        for sym in symbols:
+            try:
+                df = _fetch_history(sym, "6mo")
+                closes[sym] = df["close"]
+            except Exception:
+                continue
+
+        if len(closes) < 2:
+            raise HTTPException(status_code=422, detail="Could not fetch data for enough symbols")
+
+        valid_symbols = list(closes.keys())
+        price_df = pd.DataFrame(closes)
+        returns_df = price_df.pct_change().dropna()
+
+        mean_returns = returns_df.mean().values * 252  # annualized
+        cov_matrix = returns_df.cov().values * 252
+        n = len(valid_symbols)
+
+        # Risk-free rate
+        rf = 0.05
+
+        def neg_sharpe(weights):
+            port_return = np.dot(weights, mean_returns)
+            port_vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
+            return -(port_return - rf) / port_vol if port_vol > 0 else 0
+
+        def portfolio_vol(weights):
+            return np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
+
+        constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1}]
+        bounds = [(0, 0.4)] * n  # max 40% per asset
+        init_weights = np.array([1.0 / n] * n)
+
+        # Max Sharpe
+        max_sharpe_result = minimize(neg_sharpe, init_weights, method="SLSQP", bounds=bounds, constraints=constraints)
+        max_sharpe_weights = {valid_symbols[i]: round(float(max_sharpe_result.x[i]), 4) for i in range(n)}
+        ms_ret = float(np.dot(max_sharpe_result.x, mean_returns))
+        ms_vol = float(portfolio_vol(max_sharpe_result.x))
+        ms_sharpe = (ms_ret - rf) / ms_vol if ms_vol > 0 else 0
+
+        # Min Variance
+        min_var_result = minimize(portfolio_vol, init_weights, method="SLSQP", bounds=bounds, constraints=constraints)
+        min_var_weights = {valid_symbols[i]: round(float(min_var_result.x[i]), 4) for i in range(n)}
+        mv_ret = float(np.dot(min_var_result.x, mean_returns))
+        mv_vol = float(portfolio_vol(min_var_result.x))
+        mv_sharpe = (mv_ret - rf) / mv_vol if mv_vol > 0 else 0
+
+        # Rebalance trades (if current_weights provided)
+        rebalance = None
+        if req.current_weights:
+            rebalance = {}
+            for sym in valid_symbols:
+                current = req.current_weights.get(sym, 0)
+                target = max_sharpe_weights.get(sym, 0)
+                diff = target - current
+                if abs(diff) > 0.01:  # only if >1% change
+                    rebalance[sym] = {
+                        "current_weight": round(current, 4),
+                        "target_weight": round(target, 4),
+                        "action": "increase" if diff > 0 else "decrease",
+                        "change": round(diff, 4),
+                    }
+
+        return {
+            "symbols": valid_symbols,
+            "max_sharpe_portfolio": {
+                "weights": max_sharpe_weights,
+                "expected_return": round(ms_ret * 100, 2),
+                "volatility": round(ms_vol * 100, 2),
+                "sharpe_ratio": round(ms_sharpe, 4),
+            },
+            "min_variance_portfolio": {
+                "weights": min_var_weights,
+                "expected_return": round(mv_ret * 100, 2),
+                "volatility": round(mv_vol * 100, 2),
+                "sharpe_ratio": round(mv_sharpe, 4),
+            },
+            "rebalance_trades": rebalance,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Portfolio optimization failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Earnings & Event Calendar
+# ---------------------------------------------------------------------------
+
+
+@app.get("/earnings/{symbol}")
+async def earnings_calendar(symbol: str):
+    """Get upcoming earnings date and recent earnings history for a stock."""
+    symbol = symbol.upper()
+    logger.info("Earnings calendar for %s", symbol)
+    try:
+        ticker = yf.Ticker(symbol)
+
+        result = {
+            "symbol": symbol,
+            "upcoming_earnings": None,
+            "earnings_history": [],
+            "days_until_earnings": None,
+            "earnings_warning": None,
+        }
+
+        # Try to get calendar (upcoming earnings)
+        try:
+            cal = ticker.calendar
+            if cal is not None:
+                if isinstance(cal, pd.DataFrame) and not cal.empty:
+                    # Some yfinance versions return DataFrame
+                    earnings_date = None
+                    if "Earnings Date" in cal.index:
+                        val = cal.loc["Earnings Date"].iloc[0]
+                        if pd.notna(val):
+                            earnings_date = str(val)
+                    result["upcoming_earnings"] = earnings_date
+                elif isinstance(cal, dict):
+                    # Newer yfinance returns dict
+                    ed = cal.get("Earnings Date")
+                    if ed:
+                        if isinstance(ed, list) and len(ed) > 0:
+                            earnings_date = str(ed[0])
+                        else:
+                            earnings_date = str(ed)
+                        result["upcoming_earnings"] = earnings_date
+        except Exception:
+            pass
+
+        # Get earnings history
+        try:
+            earnings = ticker.earnings_dates
+            if earnings is not None and not earnings.empty:
+                history = []
+                for idx, row in earnings.head(8).iterrows():
+                    entry = {"date": str(idx)}
+                    if "EPS Estimate" in row:
+                        entry["eps_estimate"] = None if pd.isna(row["EPS Estimate"]) else round(float(row["EPS Estimate"]), 4)
+                    if "Reported EPS" in row:
+                        entry["eps_actual"] = None if pd.isna(row["Reported EPS"]) else round(float(row["Reported EPS"]), 4)
+                    if "Surprise(%)" in row:
+                        entry["surprise_pct"] = None if pd.isna(row["Surprise(%)"]) else round(float(row["Surprise(%)"]), 2)
+                    history.append(entry)
+                result["earnings_history"] = history
+
+                # Check if upcoming date is in the earnings_dates index
+                if result["upcoming_earnings"] is None and len(history) > 0:
+                    # The first entry might be the upcoming one (if EPS actual is NaN)
+                    first = history[0]
+                    if first.get("eps_actual") is None:
+                        result["upcoming_earnings"] = first["date"]
+        except Exception:
+            pass
+
+        # Calculate days until earnings
+        if result["upcoming_earnings"]:
+            try:
+                from datetime import datetime
+                earn_date = pd.Timestamp(result["upcoming_earnings"])
+                now = pd.Timestamp.now()
+                days = (earn_date - now).days
+                result["days_until_earnings"] = days
+
+                if 0 <= days <= 3:
+                    result["earnings_warning"] = f"EARNINGS IN {days} DAYS — high risk of gap. Consider reducing position or hedging."
+                elif days < 0 and days >= -1:
+                    result["earnings_warning"] = "EARNINGS JUST REPORTED — check results before trading."
+                elif 0 <= days <= 7:
+                    result["earnings_warning"] = f"Earnings in {days} days — be aware of increased IV and potential gap risk."
+            except Exception:
+                pass
+
+        return result
+    except Exception as e:
+        logger.exception("Earnings calendar failed for %s", symbol)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class EarningsCheckRequest(BaseModel):
+    symbols: list[str]
+
+
+@app.post("/earnings_check")
+async def earnings_check(req: EarningsCheckRequest):
+    """Check multiple symbols for upcoming earnings. Returns warnings for any reporting within 7 days."""
+    results = []
+    warnings = []
+
+    for sym in req.symbols:
+        sym = sym.upper()
+        try:
+            data = await earnings_calendar(sym)
+            entry = {
+                "symbol": sym,
+                "upcoming_earnings": data.get("upcoming_earnings"),
+                "days_until_earnings": data.get("days_until_earnings"),
+            }
+            results.append(entry)
+
+            days = data.get("days_until_earnings")
+            if days is not None and 0 <= days <= 7:
+                warnings.append(f"{sym}: earnings in {days} days!")
+        except Exception:
+            results.append({"symbol": sym, "upcoming_earnings": None, "days_until_earnings": None})
+
+    return {
+        "symbols_checked": len(results),
+        "results": results,
+        "warnings": warnings,
+        "has_imminent_earnings": len(warnings) > 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Trade Debate System (Bull/Bear/Risk Analysis)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/bull_case/{symbol}")
+async def bull_case(symbol: str, period: str = Query(default="6mo")):
+    """Generate a data-driven bull case for a stock."""
+    symbol = symbol.upper()
+    logger.info("Bull case for %s", symbol)
+    try:
+        df = _fetch_history(symbol, period)
+        info = _fetch_info(symbol)
+        tech = _run_technical(symbol, period)
+        fund = _run_fundamentals(symbol)
+        sent = _run_sentiment(symbol)
+
+        points = []
+        confidence_scores = []
+
+        # Technical bullish signals
+        ensemble = tech["ensemble"]
+        if ensemble["signal"] == "bullish":
+            points.append(f"Technical ensemble is BULLISH (confidence {ensemble['confidence']}%)")
+            confidence_scores.append(ensemble["confidence"])
+
+        for name, strat in tech["strategies"].items():
+            if strat["signal"] == "bullish" and strat["confidence"] > 50:
+                points.append(f"{name}: bullish signal (confidence {strat['confidence']}%)")
+                confidence_scores.append(strat["confidence"])
+
+        # Fundamental strengths
+        if fund["profitability"]["score"] >= 7:
+            points.append(f"Strong profitability (score {fund['profitability']['score']}/10)")
+            confidence_scores.append(70)
+        if fund["growth"]["score"] >= 6:
+            points.append(f"Solid growth (score {fund['growth']['score']}/10)")
+            confidence_scores.append(65)
+        if fund["valuation"]["score"] >= 6:
+            points.append(f"Reasonable valuation (score {fund['valuation']['score']}/10)")
+            confidence_scores.append(60)
+        if fund["fundamental_score"] >= 25:
+            points.append(f"Overall fundamentals above average ({fund['fundamental_score']}/40)")
+            confidence_scores.append(70)
+
+        # Price momentum
+        close = df["close"]
+        ret_1m = float((close.iloc[-1] / close.iloc[0] - 1) * 100) if len(close) > 20 else 0
+        if ret_1m > 5:
+            points.append(f"Price up {ret_1m:.1f}% over period — positive momentum")
+            confidence_scores.append(55)
+
+        # Volume trend
+        vol = df["volume"]
+        recent_vol = float(vol.iloc[-5:].mean())
+        avg_vol = float(vol.mean())
+        if recent_vol > avg_vol * 1.3:
+            points.append(f"Volume surging: recent avg {recent_vol:.0f} vs period avg {avg_vol:.0f}")
+            confidence_scores.append(60)
+
+        # Sentiment
+        if sent["score"] > 0.2:
+            points.append(f"Positive news sentiment (score {sent['score']:.2f})")
+            confidence_scores.append(55)
+
+        # Insider buying
+        # (approximated from info)
+        insider_pct = _safe_get(info, "heldPercentInsiders")
+        if insider_pct > 0.1:
+            points.append(f"Significant insider ownership ({insider_pct*100:.1f}%)")
+            confidence_scores.append(50)
+
+        overall_confidence = round(sum(confidence_scores) / len(confidence_scores)) if confidence_scores else 20
+
+        return {
+            "symbol": symbol,
+            "side": "bull",
+            "points": points,
+            "point_count": len(points),
+            "overall_confidence": min(95, overall_confidence),
+            "strength": "strong" if overall_confidence >= 65 else "moderate" if overall_confidence >= 45 else "weak",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Bull case failed for %s", symbol)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/bear_case/{symbol}")
+async def bear_case(symbol: str, period: str = Query(default="6mo")):
+    """Generate a data-driven bear case for a stock."""
+    symbol = symbol.upper()
+    logger.info("Bear case for %s", symbol)
+    try:
+        df = _fetch_history(symbol, period)
+        info = _fetch_info(symbol)
+        tech = _run_technical(symbol, period)
+        fund = _run_fundamentals(symbol)
+        sent = _run_sentiment(symbol)
+
+        points = []
+        confidence_scores = []
+
+        # Technical bearish signals
+        ensemble = tech["ensemble"]
+        if ensemble["signal"] == "bearish":
+            points.append(f"Technical ensemble is BEARISH (confidence {ensemble['confidence']}%)")
+            confidence_scores.append(ensemble["confidence"])
+
+        for name, strat in tech["strategies"].items():
+            if strat["signal"] == "bearish" and strat["confidence"] > 50:
+                points.append(f"{name}: bearish signal (confidence {strat['confidence']}%)")
+                confidence_scores.append(strat["confidence"])
+
+        # Fundamental weaknesses
+        if fund["profitability"]["score"] < 4:
+            points.append(f"Weak profitability (score {fund['profitability']['score']}/10)")
+            confidence_scores.append(65)
+        if fund["growth"]["score"] < 3:
+            points.append(f"Poor growth (score {fund['growth']['score']}/10)")
+            confidence_scores.append(60)
+        if fund["valuation"]["score"] < 3:
+            points.append(f"Expensive valuation (score {fund['valuation']['score']}/10)")
+            confidence_scores.append(70)
+        if fund["financial_health"]["score"] < 4:
+            points.append(f"Weak financial health (score {fund['financial_health']['score']}/10)")
+            confidence_scores.append(65)
+        if fund["fundamental_score"] < 15:
+            points.append(f"Poor overall fundamentals ({fund['fundamental_score']}/40)")
+            confidence_scores.append(70)
+
+        # Negative price action
+        close = df["close"]
+        ret_1m = float((close.iloc[-1] / close.iloc[0] - 1) * 100) if len(close) > 20 else 0
+        if ret_1m < -5:
+            points.append(f"Price down {abs(ret_1m):.1f}% over period — negative momentum")
+            confidence_scores.append(60)
+
+        # High volatility
+        sdf = _to_stockstats(df)
+        atr = float(sdf["atr_14"].iloc[-1])
+        atr_pct = atr / float(close.iloc[-1]) * 100
+        if atr_pct > 5:
+            points.append(f"Very high volatility: ATR {atr_pct:.1f}% of price — risky")
+            confidence_scores.append(55)
+
+        # Declining volume
+        vol = df["volume"]
+        recent_vol = float(vol.iloc[-5:].mean())
+        avg_vol = float(vol.mean())
+        if recent_vol < avg_vol * 0.6:
+            points.append(f"Volume drying up: recent avg {recent_vol:.0f} vs period avg {avg_vol:.0f}")
+            confidence_scores.append(50)
+
+        # Negative sentiment
+        if sent["score"] < -0.2:
+            points.append(f"Negative news sentiment (score {sent['score']:.2f})")
+            confidence_scores.append(60)
+
+        # High debt
+        debt_to_equity = _safe_get(info, "debtToEquity", 0)
+        if debt_to_equity > 200:
+            points.append(f"High debt-to-equity ratio: {debt_to_equity:.0f}%")
+            confidence_scores.append(55)
+
+        overall_confidence = round(sum(confidence_scores) / len(confidence_scores)) if confidence_scores else 20
+
+        return {
+            "symbol": symbol,
+            "side": "bear",
+            "points": points,
+            "point_count": len(points),
+            "overall_confidence": min(95, overall_confidence),
+            "strength": "strong" if overall_confidence >= 65 else "moderate" if overall_confidence >= 45 else "weak",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Bear case failed for %s", symbol)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/risk_assessment/{symbol}")
+async def risk_assessment(symbol: str, period: str = Query(default="6mo")):
+    """Assess specific risks for a stock trade."""
+    symbol = symbol.upper()
+    logger.info("Risk assessment for %s", symbol)
+    try:
+        df = _fetch_history(symbol, period)
+        info = _fetch_info(symbol)
+
+        risks = []
+        risk_score = 0  # 0-100
+
+        close = df["close"]
+        current_price = float(close.iloc[-1])
+
+        # Volatility risk
+        sdf = _to_stockstats(df)
+        atr = float(sdf["atr_14"].iloc[-1])
+        atr_pct = atr / current_price * 100
+        if atr_pct > 8:
+            risks.append({"type": "volatility", "severity": "critical", "detail": f"Extreme volatility: ATR is {atr_pct:.1f}% of price"})
+            risk_score += 25
+        elif atr_pct > 5:
+            risks.append({"type": "volatility", "severity": "high", "detail": f"High volatility: ATR is {atr_pct:.1f}% of price"})
+            risk_score += 15
+        elif atr_pct > 3:
+            risks.append({"type": "volatility", "severity": "moderate", "detail": f"Moderate volatility: ATR is {atr_pct:.1f}% of price"})
+            risk_score += 8
+
+        # Liquidity risk
+        avg_volume = float(df["volume"].mean())
+        avg_dollar_volume = avg_volume * current_price
+        if avg_dollar_volume < 100_000:
+            risks.append({"type": "liquidity", "severity": "critical", "detail": f"Very low liquidity: avg daily $ volume ${avg_dollar_volume:,.0f}"})
+            risk_score += 25
+        elif avg_dollar_volume < 500_000:
+            risks.append({"type": "liquidity", "severity": "high", "detail": f"Low liquidity: avg daily $ volume ${avg_dollar_volume:,.0f}"})
+            risk_score += 15
+        elif avg_dollar_volume < 2_000_000:
+            risks.append({"type": "liquidity", "severity": "moderate", "detail": f"Moderate liquidity: avg daily $ volume ${avg_dollar_volume:,.0f}"})
+            risk_score += 5
+
+        # Penny stock risk
+        if current_price < 5:
+            risks.append({"type": "penny_stock", "severity": "high", "detail": f"Penny stock at ${current_price:.2f} — high manipulation risk, wide spreads"})
+            risk_score += 15
+
+        # Earnings risk
+        try:
+            earn_data = await earnings_calendar(symbol)
+            days = earn_data.get("days_until_earnings")
+            if days is not None and 0 <= days <= 3:
+                risks.append({"type": "earnings", "severity": "critical", "detail": f"Earnings in {days} days — high gap risk"})
+                risk_score += 20
+            elif days is not None and 0 <= days <= 7:
+                risks.append({"type": "earnings", "severity": "high", "detail": f"Earnings in {days} days — elevated gap risk"})
+                risk_score += 10
+        except Exception:
+            pass
+
+        # Drawdown risk (max drawdown in period)
+        peak = close.expanding().max()
+        drawdown = ((close - peak) / peak * 100)
+        max_dd = float(drawdown.min())
+        if max_dd < -30:
+            risks.append({"type": "drawdown", "severity": "critical", "detail": f"Stock dropped {abs(max_dd):.1f}% from peak in this period"})
+            risk_score += 15
+        elif max_dd < -20:
+            risks.append({"type": "drawdown", "severity": "high", "detail": f"Stock dropped {abs(max_dd):.1f}% from peak in this period"})
+            risk_score += 10
+
+        # Debt risk
+        debt_to_equity = _safe_get(info, "debtToEquity", 0)
+        if debt_to_equity > 300:
+            risks.append({"type": "leverage", "severity": "high", "detail": f"Very high debt-to-equity: {debt_to_equity:.0f}%"})
+            risk_score += 10
+
+        # Short interest (approximate from beta)
+        beta = _safe_get(info, "beta", 1.0)
+        if beta > 2.0:
+            risks.append({"type": "beta", "severity": "high", "detail": f"High beta ({beta:.2f}) — amplified market moves"})
+            risk_score += 10
+
+        risk_score = min(100, risk_score)
+
+        if risk_score >= 60:
+            verdict = "HIGH RISK — proceed with extreme caution, reduce position size significantly"
+        elif risk_score >= 35:
+            verdict = "MODERATE RISK — standard position sizing, set tight stops"
+        else:
+            verdict = "LOW RISK — normal position sizing appropriate"
+
+        return {
+            "symbol": symbol,
+            "risk_score": risk_score,
+            "risk_level": "high" if risk_score >= 60 else "moderate" if risk_score >= 35 else "low",
+            "verdict": verdict,
+            "risks": risks,
+            "risk_count": len(risks),
+            "worst_case": {
+                "max_drawdown_pct": round(max_dd, 2),
+                "atr_pct": round(atr_pct, 2),
+                "potential_loss_1atr": round(atr, 4),
+                "potential_loss_2atr": round(atr * 2, 4),
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Risk assessment failed for %s", symbol)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/valuation/{symbol}")
+async def valuation(symbol: str):
+    """Simple DCF-based intrinsic value estimate."""
+    symbol = symbol.upper()
+    logger.info("Valuation for %s", symbol)
+    try:
+        info = _fetch_info(symbol)
+
+        current_price = _safe_get(info, "currentPrice") or _safe_get(info, "regularMarketPrice")
+        if current_price <= 0:
+            raise HTTPException(status_code=422, detail=f"Cannot determine current price for {symbol}")
+
+        market_cap = _safe_get(info, "marketCap")
+        shares_outstanding = _safe_get(info, "sharesOutstanding")
+
+        # Get free cash flow
+        fcf = _safe_get(info, "freeCashflow")
+        operating_cf = _safe_get(info, "operatingCashflow")
+        revenue = _safe_get(info, "totalRevenue")
+        net_income = _safe_get(info, "netIncomeToCommon")
+
+        # Growth rate estimate
+        rev_growth = _safe_get(info, "revenueGrowth")
+        earn_growth = _safe_get(info, "earningsGrowth")
+        growth_rate = max(0, min(0.30, (rev_growth + earn_growth) / 2 if rev_growth and earn_growth else rev_growth or earn_growth or 0.05))
+
+        result = {
+            "symbol": symbol,
+            "current_price": round(current_price, 2),
+            "market_cap": market_cap,
+            "valuation_metrics": {
+                "trailing_pe": round(_safe_get(info, "trailingPE", 0), 2) or None,
+                "forward_pe": round(_safe_get(info, "forwardPE", 0), 2) or None,
+                "peg_ratio": round(_safe_get(info, "pegRatio", 0), 2) or None,
+                "price_to_book": round(_safe_get(info, "priceToBook", 0), 2) or None,
+                "price_to_sales": round(_safe_get(info, "priceToSalesTrailing12Months", 0), 2) or None,
+                "ev_to_ebitda": round(_safe_get(info, "enterpriseToEbitda", 0), 2) or None,
+            },
+            "dcf_estimate": None,
+            "margin_of_safety": None,
+            "verdict": None,
+        }
+
+        # Simple DCF if we have FCF
+        if fcf and fcf > 0 and shares_outstanding and shares_outstanding > 0:
+            discount_rate = 0.10  # 10% required return
+            terminal_growth = 0.025  # 2.5% terminal growth
+            projection_years = 5
+
+            # Project FCF forward
+            projected_fcf = []
+            current_fcf = fcf
+            for year in range(1, projection_years + 1):
+                current_fcf *= (1 + growth_rate)
+                pv = current_fcf / (1 + discount_rate) ** year
+                projected_fcf.append(round(pv, 2))
+
+            # Terminal value (Gordon Growth)
+            terminal_fcf = current_fcf * (1 + terminal_growth)
+            terminal_value = terminal_fcf / (discount_rate - terminal_growth)
+            pv_terminal = terminal_value / (1 + discount_rate) ** projection_years
+
+            # Intrinsic value
+            total_value = sum(projected_fcf) + pv_terminal
+            intrinsic_per_share = total_value / shares_outstanding
+            margin_of_safety = ((intrinsic_per_share - current_price) / intrinsic_per_share) * 100
+
+            result["dcf_estimate"] = {
+                "intrinsic_value": round(intrinsic_per_share, 2),
+                "growth_rate_used": round(growth_rate * 100, 1),
+                "discount_rate": round(discount_rate * 100, 1),
+                "fcf_used": fcf,
+            }
+            result["margin_of_safety"] = round(margin_of_safety, 1)
+
+            if margin_of_safety > 30:
+                result["verdict"] = f"UNDERVALUED — trading {abs(margin_of_safety):.0f}% below DCF estimate (${intrinsic_per_share:.2f}). Good entry if thesis is sound."
+            elif margin_of_safety > 10:
+                result["verdict"] = f"FAIRLY VALUED to slightly cheap — {margin_of_safety:.0f}% below DCF estimate (${intrinsic_per_share:.2f})."
+            elif margin_of_safety > -10:
+                result["verdict"] = f"FAIRLY VALUED — within 10% of DCF estimate (${intrinsic_per_share:.2f})."
+            else:
+                result["verdict"] = f"OVERVALUED — trading {abs(margin_of_safety):.0f}% above DCF estimate (${intrinsic_per_share:.2f}). Consider waiting for a pullback."
+        else:
+            # Fall back to multiples-based valuation
+            pe = _safe_get(info, "trailingPE", 0)
+            forward_pe = _safe_get(info, "forwardPE", 0)
+
+            if forward_pe > 0 and pe > 0:
+                if forward_pe < pe * 0.8:
+                    result["verdict"] = f"Forward P/E ({forward_pe:.1f}) significantly below trailing P/E ({pe:.1f}) — earnings expected to grow. Potentially undervalued."
+                elif forward_pe > pe * 1.2:
+                    result["verdict"] = f"Forward P/E ({forward_pe:.1f}) above trailing P/E ({pe:.1f}) — earnings expected to decline. Caution."
+                else:
+                    result["verdict"] = f"Forward P/E ({forward_pe:.1f}) close to trailing P/E ({pe:.1f}) — stable earnings outlook."
+            else:
+                result["verdict"] = "Insufficient data for DCF. Use multiples comparison with sector peers."
+
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Valuation failed for %s", symbol)
         raise HTTPException(status_code=500, detail=str(e))
 
 

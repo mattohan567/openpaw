@@ -10,6 +10,8 @@ import { createMemoryTools } from "../memory.js";
 import { createAlertTools } from "./alerts.js";
 import { createRiskTools } from "./risk-tools.js";
 import { createQuantTools } from "./quant.js";
+import { createMacroTools } from "./macro.js";
+import { createDebateTools } from "./debate.js";
 import { createNotifyTools } from "./notify-owner.js";
 
 export function createOpenPawTools(
@@ -25,6 +27,8 @@ export function createOpenPawTools(
     ...createAlertTools(stream ?? null),
     ...createRiskTools(config),
     ...createQuantTools(),
+    ...createMacroTools(),
+    ...createDebateTools(),
     ...createMemoryTools(),
     ...createNotifyTools(),
   ];

@@ -329,5 +329,122 @@ export function createAlpacaTradingTools(config: OpenPawConfig): Tool[] {
         return JSON.stringify(result);
       },
     },
+    {
+      name: "trailing_stop_order",
+      description:
+        "Place a trailing stop sell order. The stop price trails the stock's high by a fixed percentage or dollar amount. Locks in gains as the stock moves up. Use trail_percent for %-based trailing (e.g., 3 means 3%) or trail_price for dollar-based trailing.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          symbol: { type: "string", description: "Stock ticker symbol (e.g. AAPL, NVDA)" },
+          qty: { type: "number", description: "Number of shares" },
+          trail_percent: { type: "number", description: "Trail by this percentage (e.g., 3 = 3%)" },
+          trail_price: { type: "number", description: "Trail by this dollar amount" },
+          time_in_force: {
+            type: "string",
+            enum: ["day", "gtc"],
+            description: "Time in force (default: gtc)",
+          },
+        },
+        required: ["symbol", "qty"],
+      },
+      execute: async (params) => {
+        const symbol = (params.symbol as string).toUpperCase();
+        const qty = Number(params.qty);
+        const trailPercent = params.trail_percent != null ? Number(params.trail_percent) : undefined;
+        const trailPrice = params.trail_price != null ? Number(params.trail_price) : undefined;
+
+        // Validate trail param — exactly one must be provided
+        if (trailPercent != null && trailPrice != null) {
+          return "BLOCKED: Provide either trail_percent or trail_price, not both.";
+        }
+        if (trailPercent == null && trailPrice == null) {
+          return "BLOCKED: Must provide either trail_percent or trail_price.";
+        }
+
+        // Validate we actually hold enough shares
+        try {
+          const pos = (await alpacaRequest(config, `/v2/positions/${symbol}`)) as Record<string, string>;
+          const held = Number(pos.qty) || 0;
+          if (qty > held) {
+            return `BLOCKED: Trying to place trailing stop for ${qty} shares of ${symbol} but only holding ${held}.`;
+          }
+        } catch {
+          return `BLOCKED: No open position in ${symbol}. Nothing to protect.`;
+        }
+
+        const order: Record<string, unknown> = {
+          symbol,
+          qty: String(qty),
+          side: "sell",
+          type: "trailing_stop",
+          time_in_force: (params.time_in_force as string) || "gtc",
+        };
+        if (trailPercent != null) order.trail_percent = String(trailPercent);
+        if (trailPrice != null) order.trail_price = String(trailPrice);
+
+        const result = await alpacaRequest(config, "/v2/orders", "POST", order);
+        logTrade(config, { action: "trailing_stop", ...order, result });
+        return JSON.stringify(result);
+      },
+    },
+    {
+      name: "replace_stop_with_trailing",
+      description:
+        "Replace an existing stop-loss order with a trailing stop. Cancels the old order and places a new trailing stop. Use this after a position moves in your favor to lock in gains while giving room to run.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          order_id: { type: "string", description: "The existing stop order ID to cancel" },
+          symbol: { type: "string", description: "Stock ticker symbol" },
+          qty: { type: "number", description: "Number of shares" },
+          trail_percent: { type: "number", description: "Trail percentage (e.g., 3 = 3%)" },
+          trail_price: { type: "number", description: "Trail dollar amount" },
+          time_in_force: {
+            type: "string",
+            enum: ["day", "gtc"],
+            description: "Time in force (default: gtc)",
+          },
+        },
+        required: ["order_id", "symbol", "qty"],
+      },
+      execute: async (params) => {
+        const orderId = params.order_id as string;
+        const err = validateId(orderId, "order_id");
+        if (err) return err;
+
+        const symbol = (params.symbol as string).toUpperCase();
+        const qty = Number(params.qty);
+        const trailPercent = params.trail_percent != null ? Number(params.trail_percent) : undefined;
+        const trailPrice = params.trail_price != null ? Number(params.trail_price) : undefined;
+
+        // Validate trail param — exactly one must be provided
+        if (trailPercent != null && trailPrice != null) {
+          return "BLOCKED: Provide either trail_percent or trail_price, not both.";
+        }
+        if (trailPercent == null && trailPrice == null) {
+          return "BLOCKED: Must provide either trail_percent or trail_price.";
+        }
+
+        // Cancel the old order
+        await alpacaRequest(config, `/v2/orders/${orderId}`, "DELETE");
+
+        // Place new trailing stop order
+        const order: Record<string, unknown> = {
+          symbol,
+          qty: String(qty),
+          side: "sell",
+          type: "trailing_stop",
+          time_in_force: (params.time_in_force as string) || "gtc",
+        };
+        if (trailPercent != null) order.trail_percent = String(trailPercent);
+        if (trailPrice != null) order.trail_price = String(trailPrice);
+
+        const result = await alpacaRequest(config, "/v2/orders", "POST", order);
+        const trail = trailPercent != null ? `${trailPercent}%` : `$${trailPrice}`;
+        logTrade(config, { action: "replace_stop_trailing", cancelledOrderId: orderId, ...order, result });
+        return `Cancelled order ${orderId}, placed trailing stop for ${qty} ${symbol} with ${trail} trail.`;
+      },
+    },
   ];
 }

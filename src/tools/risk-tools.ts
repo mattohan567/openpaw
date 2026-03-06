@@ -133,5 +133,89 @@ export function createRiskTools(config: OpenPawConfig): Tool[] {
         }
       },
     },
+    {
+      name: "review_closed_trades",
+      description:
+        "Review recently closed positions and generate a post-mortem. Checks trades closed in the last N days, computes P&L, and identifies lessons learned. Use this regularly to improve your trading.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          days: { type: "number", description: "Review trades from last N days (default: 7)" },
+        },
+      },
+      execute: async (params) => {
+        const days = params.days ? Number(params.days) : 7;
+
+        try {
+          // Fetch closed orders from Alpaca
+          const ordersRes = await fetch(
+            `${config.trading.alpacaBaseUrl}/v2/orders?status=closed&limit=100&direction=desc`,
+            { headers: alpacaHeaders(config) },
+          );
+          if (!ordersRes.ok) return `Alpaca orders API error: ${ordersRes.status}`;
+          const _closedOrders = (await ordersRes.json()) as Record<string, unknown>[];
+
+          // Load trade log and filter to recent
+          const trades = loadTradeLog(config.tradeLogFile);
+          const recentTrades = getRecentTrades(trades, days);
+
+          if (recentTrades.length === 0) {
+            return `No closed trades in the last ${days} days.`;
+          }
+
+          const stats = analyzeTradePerformance(recentTrades);
+
+          // Build post-mortem report
+          const lines: string[] = [];
+          lines.push(`=== Trade Post-Mortem (last ${days} days) ===\n`);
+
+          const now = new Date();
+          const start = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+          lines.push(`Period: ${start.toISOString().slice(0, 10)} to ${now.toISOString().slice(0, 10)}`);
+          lines.push(`Completed round-trip trades: ${stats.winCount + stats.lossCount}`);
+          lines.push(`Overall P&L: $${stats.realizedPl.toFixed(2)}`);
+          lines.push(`Win rate: ${(stats.winRate * 100).toFixed(1)}% (${stats.winCount}W / ${stats.lossCount}L)`);
+          lines.push(`Sharpe ratio: ${stats.sharpeRatio.toFixed(2)}`);
+          lines.push(`Max drawdown: ${(stats.maxDrawdown * 100).toFixed(1)}%`);
+          lines.push("");
+
+          if (stats.largestWin > 0) {
+            lines.push(`Best trade: +$${stats.largestWin.toFixed(2)}`);
+          }
+          if (stats.largestLoss < 0) {
+            lines.push(`Worst trade: $${stats.largestLoss.toFixed(2)}`);
+          }
+          lines.push(`Avg win: +$${stats.avgWin.toFixed(2)} | Avg loss: -$${stats.avgLoss.toFixed(2)}`);
+          lines.push("");
+
+          // Day-of-week patterns
+          const dayEntries = Object.entries(stats.byDayOfWeek).sort(
+            (a, b) => b[1].pl - a[1].pl,
+          );
+          if (dayEntries.length > 1) {
+            const bestDay = dayEntries[0];
+            const worstDay = dayEntries[dayEntries.length - 1];
+            lines.push(`Best day: ${bestDay[0]} (+$${bestDay[1].pl.toFixed(2)}, ${bestDay[1].trades} trades)`);
+            lines.push(`Worst day: ${worstDay[0]} ($${worstDay[1].pl.toFixed(2)}, ${worstDay[1].trades} trades)`);
+            lines.push("");
+          }
+
+          lines.push("--- Lessons ---");
+          lines.push(
+            "Think about: What setups worked? What went wrong on losers? Were stops too tight or too loose? Did you hold too long or exit too early?",
+          );
+          lines.push("");
+
+          lines.push("*Action items:*");
+          lines.push('- Write any new lessons to curated memory (memory_write target "curated")');
+          lines.push("- Adjust strategy if win rate < 50% or drawdown is high");
+          lines.push("- Check if any losing patterns should be avoided");
+
+          return lines.join("\n");
+        } catch (err) {
+          return `Trade review failed: ${err instanceof Error ? err.message : "unknown error"}`;
+        }
+      },
+    },
   ];
 }

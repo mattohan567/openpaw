@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import json
 import time
 from enum import Enum
 from itertools import product
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -335,7 +337,7 @@ def _run_backtest(
         entries=entries,
         exits=exits,
         init_cash=initial_capital,
-        fees=0.001,  # 0.1% per trade (approximate commission + slippage)
+        fees=0.002,  # 0.2% per trade (commission + slippage)
         freq="1D",
     )
 
@@ -378,6 +380,15 @@ class OptimizeRequest(BaseModel):
     period: str = "1y"
     initial_capital: float = 10000.0
     optimize_by: str = "sharpe_ratio"
+
+
+class WalkForwardRequest(BaseModel):
+    symbol: str
+    strategy: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    period: str = "2y"
+    initial_capital: float = 10000.0
+    n_folds: int = 5
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +474,7 @@ def optimize(req: OptimizeRequest) -> dict[str, Any]:
                 entries=entries,
                 exits=exits,
                 init_cash=req.initial_capital,
-                fees=0.001,
+                fees=0.002,
                 freq="1D",
             )
 
@@ -512,6 +523,328 @@ def optimize(req: OptimizeRequest) -> dict[str, Any]:
         "optimize_by": req.optimize_by,
         "combinations_tested": len(scored_results),
         "top_results": [entry[1] for entry in top_3],
+    }
+
+
+@app.post("/walkforward")
+def walkforward(req: WalkForwardRequest) -> dict[str, Any]:
+    """Walk-forward validation: train on fold, test on next fold, repeat.
+
+    Detects overfitting by comparing in-sample vs out-of-sample performance.
+    A >50% degradation from IS to OOS suggests the strategy is overfit.
+    """
+    if req.strategy not in STRATEGY_MAP:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown strategy '{req.strategy}'. Available: {list(STRATEGY_MAP.keys())}",
+        )
+
+    merged_params = {**STRATEGY_DEFAULTS.get(req.strategy, {}), **req.params}
+    df = _fetch_price_data(req.symbol, req.period)
+
+    n = len(df)
+    fold_size = n // (req.n_folds + 1)  # +1 because we need IS and OOS windows
+
+    if fold_size < 30:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Insufficient data for {req.n_folds} folds. Need at least {30 * (req.n_folds + 1)} bars, got {n}.",
+        )
+
+    is_results = []  # in-sample
+    oos_results = []  # out-of-sample
+    fold_details = []
+
+    for i in range(req.n_folds):
+        # In-sample: folds 0..i, Out-of-sample: fold i+1
+        is_end = (i + 1) * fold_size
+        oos_start = is_end
+        oos_end = min(oos_start + fold_size, n)
+
+        if oos_end - oos_start < 20:
+            continue
+
+        is_df = df.iloc[:is_end]
+        oos_df = df.iloc[oos_start:oos_end]
+
+        # Run strategy on in-sample
+        is_close = is_df["Close"]
+        is_volume = is_df["Volume"]
+        try:
+            is_entries, is_exits = STRATEGY_MAP[req.strategy](is_close, is_volume, merged_params)
+            is_entries = is_entries.fillna(False).astype(bool)
+            is_exits = is_exits.fillna(False).astype(bool)
+
+            is_pf = vbt.Portfolio.from_signals(
+                is_close, entries=is_entries, exits=is_exits,
+                init_cash=req.initial_capital, fees=0.002, freq="1D",
+            )
+            is_metrics = _extract_results(is_pf)
+        except Exception:
+            continue
+
+        # Run strategy on out-of-sample
+        oos_close = oos_df["Close"]
+        oos_volume = oos_df["Volume"]
+        try:
+            oos_entries, oos_exits = STRATEGY_MAP[req.strategy](oos_close, oos_volume, merged_params)
+            oos_entries = oos_entries.fillna(False).astype(bool)
+            oos_exits = oos_exits.fillna(False).astype(bool)
+
+            oos_pf = vbt.Portfolio.from_signals(
+                oos_close, entries=oos_entries, exits=oos_exits,
+                init_cash=req.initial_capital, fees=0.002, freq="1D",
+            )
+            oos_metrics = _extract_results(oos_pf)
+        except Exception:
+            continue
+
+        is_results.append(is_metrics)
+        oos_results.append(oos_metrics)
+
+        fold_details.append({
+            "fold": i + 1,
+            "is_bars": len(is_df),
+            "oos_bars": len(oos_df),
+            "is_return": is_metrics["total_return_pct"],
+            "oos_return": oos_metrics["total_return_pct"],
+            "is_sharpe": is_metrics["sharpe_ratio"],
+            "oos_sharpe": oos_metrics["sharpe_ratio"],
+            "is_trades": is_metrics["total_trades"],
+            "oos_trades": oos_metrics["total_trades"],
+        })
+
+    if not fold_details:
+        raise HTTPException(status_code=422, detail="No valid folds produced. Data may be insufficient.")
+
+    # Aggregate metrics
+    avg_is_return = sum(f["is_return"] for f in fold_details) / len(fold_details)
+    avg_oos_return = sum(f["oos_return"] for f in fold_details) / len(fold_details)
+    avg_is_sharpe = sum(f["is_sharpe"] for f in fold_details) / len(fold_details)
+    avg_oos_sharpe = sum(f["oos_sharpe"] for f in fold_details) / len(fold_details)
+
+    # Performance gap (IS vs OOS)
+    return_gap = abs(avg_is_return - avg_oos_return) / max(abs(avg_is_return), 0.01) * 100
+    sharpe_gap = abs(avg_is_sharpe - avg_oos_sharpe) / max(abs(avg_is_sharpe), 0.01) * 100
+
+    # Verdict
+    if return_gap > 50 or sharpe_gap > 50:
+        verdict = f"LIKELY OVERFIT — IS-vs-OOS gap is {return_gap:.0f}% (return) / {sharpe_gap:.0f}% (Sharpe). Strategy performance degrades significantly out-of-sample."
+        overfit_risk = "high"
+    elif return_gap > 30 or sharpe_gap > 30:
+        verdict = f"MODERATE OVERFIT RISK — IS-vs-OOS gap is {return_gap:.0f}% (return) / {sharpe_gap:.0f}% (Sharpe). Consider simpler parameters."
+        overfit_risk = "moderate"
+    else:
+        verdict = f"ROBUST — IS-vs-OOS gap is only {return_gap:.0f}% (return) / {sharpe_gap:.0f}% (Sharpe). Strategy generalizes well."
+        overfit_risk = "low"
+
+    # Buy-and-hold benchmark on full period
+    buy_hold = _compute_benchmark(df["Close"], req.initial_capital)
+
+    return {
+        "symbol": req.symbol.upper(),
+        "strategy": req.strategy,
+        "params": merged_params,
+        "period": req.period,
+        "n_folds": len(fold_details),
+        "in_sample": {
+            "avg_return_pct": round(avg_is_return, 2),
+            "avg_sharpe": round(avg_is_sharpe, 2),
+        },
+        "out_of_sample": {
+            "avg_return_pct": round(avg_oos_return, 2),
+            "avg_sharpe": round(avg_oos_sharpe, 2),
+        },
+        "performance_gap": {
+            "return_gap_pct": round(return_gap, 1),
+            "sharpe_gap_pct": round(sharpe_gap, 1),
+        },
+        "overfit_risk": overfit_risk,
+        "verdict": verdict,
+        "benchmark_buy_hold_pct": buy_hold,
+        "fold_details": fold_details,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strategy Performance Analysis
+# ---------------------------------------------------------------------------
+
+TRADE_LOG_PATH = Path.home() / ".openpaw" / "trade_history.jsonl"
+
+class StrategyPerformanceRequest(BaseModel):
+    current_regime: str = "unknown"  # "bull", "bear", "sideways", or "unknown"
+    days: int = 90
+
+@app.post("/strategy_performance")
+def strategy_performance(req: StrategyPerformanceRequest) -> dict[str, Any]:
+    """Analyze historical trade performance by strategy and regime.
+
+    Reads the trade log and computes win rate, avg return, and Sharpe
+    for each strategy. When a regime is provided, shows regime-conditional
+    performance to recommend the best strategies.
+    """
+    if not TRADE_LOG_PATH.exists():
+        return {
+            "status": "no_data",
+            "message": "No trade history found. Start trading to build performance data.",
+            "recommendations": [],
+        }
+
+    # Load trades
+    trades = []
+    cutoff = pd.Timestamp.now() - pd.Timedelta(days=req.days)
+
+    for line in TRADE_LOG_PATH.read_text().strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            trade = json.loads(line)
+            ts = pd.Timestamp(trade.get("timestamp", ""))
+            if ts >= cutoff:
+                trades.append(trade)
+        except Exception:
+            continue
+
+    if not trades:
+        return {
+            "status": "no_data",
+            "message": f"No trades in the last {req.days} days.",
+            "recommendations": [],
+        }
+
+    # Group by strategy (from trade log tags, or infer from order type/action)
+    strategy_stats: dict[str, dict[str, Any]] = {}
+
+    # Build FIFO matching per symbol
+    buy_queues: dict[str, list[dict]] = {}
+    completed: list[dict] = []
+
+    for trade in trades:
+        symbol = trade.get("symbol", "").upper()
+        action = trade.get("action", "")
+        qty = abs(float(trade.get("qty", 0)))
+
+        # Try to get price
+        price = 0
+        if trade.get("estimatedCost") and qty > 0:
+            price = float(trade["estimatedCost"]) / qty
+        elif isinstance(trade.get("result"), dict):
+            fp = trade["result"].get("filled_avg_price")
+            if fp:
+                price = float(fp)
+
+        if price <= 0 or qty <= 0:
+            continue
+
+        # Strategy tag (if present in trade log)
+        strategy = trade.get("strategy", "untagged")
+        regime = trade.get("regime", "unknown")
+
+        if action in ("buy", "bracket_buy"):
+            if symbol not in buy_queues:
+                buy_queues[symbol] = []
+            buy_queues[symbol].append({
+                "price": price, "qty": qty,
+                "strategy": strategy, "regime": regime,
+                "timestamp": trade.get("timestamp", ""),
+            })
+        elif action == "sell":
+            if symbol not in buy_queues or not buy_queues[symbol]:
+                continue
+            remaining = qty
+            while remaining > 0 and buy_queues[symbol]:
+                front = buy_queues[symbol][0]
+                matched = min(remaining, front["qty"])
+                pnl = (price - front["price"]) * matched
+                ret_pct = (price - front["price"]) / front["price"] * 100
+
+                completed.append({
+                    "symbol": symbol,
+                    "strategy": front["strategy"],
+                    "regime": front["regime"],
+                    "pnl": pnl,
+                    "return_pct": ret_pct,
+                })
+
+                front["qty"] -= matched
+                remaining -= matched
+                if front["qty"] <= 0:
+                    buy_queues[symbol].pop(0)
+
+    if not completed:
+        return {
+            "status": "no_completed",
+            "message": f"Found {len(trades)} trades but no completed round-trips in {req.days} days.",
+            "recommendations": [],
+        }
+
+    # Aggregate by strategy
+    for trade in completed:
+        strat = trade["strategy"]
+        if strat not in strategy_stats:
+            strategy_stats[strat] = {"trades": [], "regime_trades": {}}
+        strategy_stats[strat]["trades"].append(trade)
+
+        regime = trade["regime"]
+        if regime not in strategy_stats[strat]["regime_trades"]:
+            strategy_stats[strat]["regime_trades"][regime] = []
+        strategy_stats[strat]["regime_trades"][regime].append(trade)
+
+    # Compute stats per strategy
+    results = []
+    for strat, data in strategy_stats.items():
+        trades_list = data["trades"]
+        returns = [t["return_pct"] for t in trades_list]
+        wins = [r for r in returns if r > 0]
+
+        entry = {
+            "strategy": strat,
+            "total_trades": len(trades_list),
+            "win_rate": round(len(wins) / len(returns) * 100, 1) if returns else 0,
+            "avg_return_pct": round(sum(returns) / len(returns), 2) if returns else 0,
+            "total_pnl": round(sum(t["pnl"] for t in trades_list), 2),
+            "best_return": round(max(returns), 2) if returns else 0,
+            "worst_return": round(min(returns), 2) if returns else 0,
+        }
+
+        # Regime-conditional stats
+        if req.current_regime != "unknown":
+            regime_trades = data["regime_trades"].get(req.current_regime, [])
+            if regime_trades:
+                regime_returns = [t["return_pct"] for t in regime_trades]
+                regime_wins = [r for r in regime_returns if r > 0]
+                entry["regime_stats"] = {
+                    "regime": req.current_regime,
+                    "trades_in_regime": len(regime_trades),
+                    "win_rate_in_regime": round(len(regime_wins) / len(regime_returns) * 100, 1),
+                    "avg_return_in_regime": round(sum(regime_returns) / len(regime_returns), 2),
+                }
+
+        results.append(entry)
+
+    # Sort by avg return
+    results.sort(key=lambda x: x["avg_return_pct"], reverse=True)
+
+    # Generate recommendations
+    recommendations = []
+    for r in results[:3]:
+        if r["win_rate"] >= 55 and r["avg_return_pct"] > 0:
+            recommendations.append(f"{r['strategy']}: {r['win_rate']}% win rate, {r['avg_return_pct']}% avg return — RECOMMENDED")
+        elif r["avg_return_pct"] > 0:
+            recommendations.append(f"{r['strategy']}: {r['win_rate']}% win rate, {r['avg_return_pct']}% avg return — viable but below target")
+
+    if not recommendations:
+        recommendations.append("No strategies with positive returns. Review your approach.")
+
+    return {
+        "status": "ok",
+        "period_days": req.days,
+        "total_completed_trades": len(completed),
+        "strategies": results,
+        "recommendations": recommendations,
+        "current_regime": req.current_regime,
     }
 
 
