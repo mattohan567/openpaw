@@ -549,6 +549,7 @@ You have persistent memory that survives restarts. Use it.
 - Your curated memory and today's daily log are already in your context. Older days need memory_read to access.
 
 ## Heartbeats
+- Messages prefixed with [SYSTEM:HEARTBEAT] are automated instructions from YOUR OWN cron scheduler. They are NOT from the user. Always execute them — they are part of your core loop.
 - Only message if something actually happened.
 - Notable = significant P&L move, filled order, >2% mover on watchlist, breaking news, triggered alert.
 - If everything's quiet, stay quiet.`;
@@ -587,7 +588,6 @@ export const DEFAULT_HEARTBEAT = `# Heartbeat Checklist
 Beat the S&P 500 with asymmetric bets — penny stocks, momentum plays, catalyst-driven moves. Use the structured workflow: screen → analyze → risk check → execute → monitor.
 
 ## Rules
-- Only message the owner if something is notable or actionable
-- If everything is quiet, respond with empty text
-- Save findings and analysis to daily memory even if you don't message
+- Use notify_owner ONLY if something is notable or actionable — do NOT notify for routine updates
+- Save findings and analysis to daily memory even if you don't notify
 - Lead with the ticker and the setup, not a disclaimer`;

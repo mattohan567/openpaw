@@ -22,6 +22,7 @@ import { openSession, archiveOldSessions, type SessionStore } from "./session.js
 import { startHeartbeat, startMarketOpenJob, startMarketCloseJob } from "./cron.js";
 import { AlpacaStream } from "./streaming.js";
 import { startSidecars, stopSidecars } from "./sidecars.js";
+import { setNotifySender } from "./tools/notify-owner.js";
 import { createSubsystemLogger, pruneOldLogs } from "./logger.js";
 import { pruneOldDailyLogs } from "./memory.js";
 
@@ -182,6 +183,9 @@ export async function startGateway(): Promise<GatewayServer> {
     }
   };
 
+  // Wire up notify_owner tool so agent can message owner on demand
+  setNotifySender(sendWhatsApp);
+
   // Wire up real-time alerts → WhatsApp notifications
   if (stream) {
     stream.on("alert_triggered", async (event) => {
@@ -193,12 +197,9 @@ export async function startGateway(): Promise<GatewayServer> {
       await sendWhatsApp(msg);
 
       try {
-        const result = await enqueueTurn(
-          `PRICE ALERT TRIGGERED: ${alert.symbol} ${alert.condition} $${alert.price.toFixed(2)}. Current price: $${currentPrice.toFixed(2)}.${alert.message ? ` Context: ${alert.message}` : ""} — Should you act on this?`,
+        await enqueueTurn(
+          `[SYSTEM:HEARTBEAT] This is an automated price alert from your streaming engine, not a user message. Execute the following:\n\nPRICE ALERT TRIGGERED: ${alert.symbol} ${alert.condition} $${alert.price.toFixed(2)}. Current price: $${currentPrice.toFixed(2)}.${alert.message ? ` Context: ${alert.message}` : ""} — Should you act on this? Use notify_owner if you have actionable advice.`,
         );
-        if (result.response.trim()) {
-          await sendWhatsApp(result.response);
-        }
       } catch (err) {
         log.error("Alert agent error:", err);
       }
@@ -206,7 +207,7 @@ export async function startGateway(): Promise<GatewayServer> {
   }
 
   // Start cron jobs — pass enqueueTurn so heartbeats are serialized too
-  const cronCtx = { config, tools, sendWhatsApp, agent, session, enqueueTurn };
+  const cronCtx = { config, tools, agent, session, enqueueTurn };
   const heartbeatJob = startHeartbeat(cronCtx);
   const marketOpenJob = startMarketOpenJob(cronCtx);
   const marketCloseJob = startMarketCloseJob(cronCtx);

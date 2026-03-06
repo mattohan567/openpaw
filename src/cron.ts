@@ -18,7 +18,6 @@ import type { Tool } from "./tools/types.js";
 export interface HeartbeatContext {
   config: OpenPawConfig;
   tools: Tool[];
-  sendWhatsApp: (text: string) => Promise<void>;
   agent: Agent;
   session: SessionStore;
   enqueueTurn: (
@@ -53,7 +52,7 @@ export function startHeartbeat(ctx: HeartbeatContext): CronJob {
     }
 
     const marketOpen = isMarketHours();
-    const prompt = marketOpen
+    const rawPrompt = marketOpen
       ? loadHeartbeatPrompt()
       : `Off-hours research. Market is closed — use this time to find tomorrow's plays:
 - Use get_top_movers and get_most_active to see what moved today
@@ -63,17 +62,14 @@ export function startHeartbeat(ctx: HeartbeatContext): CronJob {
 - Update your watchlist with anything worth watching at open
 - Review and consolidate your memory
 
-Only message the owner if you found something genuinely actionable for tomorrow. Save all research to daily memory either way. Respond with empty text if nothing notable.`;
+Use notify_owner ONLY if you found something genuinely actionable for tomorrow. Save all research to daily memory either way. Do NOT notify for routine housekeeping.`;
+    const prompt = `[SYSTEM:HEARTBEAT] This is an automated heartbeat from your cron scheduler, not a user message. Execute the following instructions:\n\n${rawPrompt}`;
 
     console.log(`[Heartbeat] Running at ${new Date().toISOString()} (market ${marketOpen ? "open" : "closed"})`);
 
     running = true;
     try {
-      const result = await ctx.enqueueTurn(prompt);
-
-      if (result.response.trim()) {
-        await ctx.sendWhatsApp(result.response);
-      }
+      await ctx.enqueueTurn(prompt);
     } catch (err) {
       console.error("[Heartbeat] Error:", err);
     } finally {
@@ -94,12 +90,9 @@ export function startMarketOpenJob(ctx: HeartbeatContext): CronJob | null {
     async () => {
       console.log("[Cron] Market open - morning scan.");
       try {
-        const result = await ctx.enqueueTurn(
-          "Market just opened. Check the portfolio, scan watchlist for pre-market movers, check overnight news on our holdings. Send me a brief morning briefing. Save a summary to today's daily log.",
+        await ctx.enqueueTurn(
+          "[SYSTEM:HEARTBEAT] This is an automated market-open trigger from your cron scheduler, not a user message. Execute the following instructions:\n\nMarket just opened. Check the portfolio, scan watchlist for pre-market movers, check overnight news on our holdings. Use notify_owner to send a brief morning briefing. Save a summary to today's daily log.",
         );
-        if (result.response.trim()) {
-          await ctx.sendWhatsApp(result.response);
-        }
       } catch (err) {
         console.error("[Cron] Market open error:", err);
       }
@@ -122,12 +115,9 @@ export function startMarketCloseJob(ctx: HeartbeatContext): CronJob | null {
     async () => {
       console.log("[Cron] Market close - daily report.");
       try {
-        const result = await ctx.enqueueTurn(
-          "Market just closed. End-of-day report: portfolio P&L today, trades executed, notable movers on watchlist, any after-hours news. Save the report to daily log and update curated memory with new insights.",
+        await ctx.enqueueTurn(
+          "[SYSTEM:HEARTBEAT] This is an automated market-close trigger from your cron scheduler, not a user message. Execute the following instructions:\n\nMarket just closed. End-of-day report: portfolio P&L today, trades executed, notable movers on watchlist, any after-hours news. Use notify_owner to send the report. Save the report to daily log and update curated memory with new insights.",
         );
-        if (result.response.trim()) {
-          await ctx.sendWhatsApp(result.response);
-        }
       } catch (err) {
         console.error("[Cron] Market close error:", err);
       }
